@@ -4,11 +4,13 @@ import { useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Check, Gauge, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import { setSpeed } from "./actions";
+import { setAskWorkers, setSpeed } from "./actions";
 
 type Speed = { id: string; parallel: number; label: string; hint: string };
 
-export function SpeedSetting({ speeds, current, recommended, browsers }: { speeds: Speed[]; current: string; recommended: string; browsers: number }) {
+export function SpeedSetting({
+  speeds, current, recommended, browsers, workers, ask,
+}: { speeds: Speed[]; current: string; recommended: string; browsers: number; workers: number | null; ask: boolean }) {
   const router = useRouter();
   const [pending, start] = useTransition();
   const pick = (id: string) =>
@@ -34,7 +36,7 @@ export function SpeedSetting({ speeds, current, recommended, browsers }: { speed
       </div>
       <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4" role="radiogroup" aria-label="Kecepatan pembuatan">
         {speeds.map((s) => {
-          const on = s.id === current;
+          const on = s.id === current && !workers;
           return (
             <button
               key={s.id}
@@ -56,6 +58,27 @@ export function SpeedSetting({ speeds, current, recommended, browsers }: { speed
           );
         })}
       </div>
+      {workers && (
+        <p className="text-xs">
+          Saat ini: <b>{workers} pekerja</b> (dipilih saat mulai membuat). Klik salah satu pilihan di atas untuk kembali ke preset.
+        </p>
+      )}
+      <label className="flex cursor-pointer items-center gap-2 text-xs">
+        <input
+          type="checkbox"
+          checked={ask}
+          disabled={pending}
+          onChange={(e) => {
+            const on = e.target.checked;
+            start(async () => {
+              await setAskWorkers(on);
+              router.refresh();
+            });
+          }}
+          className="size-3.5 accent-primary"
+        />
+        Tanya jumlah pekerja &amp; cara membuat (API/browser) setiap mulai membuat gambar atau video
+      </label>
       <p className="text-[11px] text-muted-foreground">Mesin video menyiapkan {browsers} browser verifikasi otomatis untuk pilihan ini.</p>
     </section>
   );

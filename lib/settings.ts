@@ -22,7 +22,17 @@ type VoiceSettings = {
   cartesiaVoiceName?: string;
   speed?: number; // 0.6–1.5
 };
-type Settings = { speed: SpeedId; showcaseSyncMinutes: number /* 0 = off */; voice: VoiceSettings };
+/** How Flow images/videos are made: flow2api's API, the account's own browser, or API with browser fallback. */
+export const FLOW_ENGINES = ["auto", "api", "browser"] as const;
+export type FlowEngine = (typeof FLOW_ENGINES)[number];
+type Settings = {
+  speed: SpeedId;
+  workers?: number; // exact concurrent workers chosen in the "before generating" dialog; overrides the speed preset
+  askWorkers?: boolean; // ask workers + engine every time generation starts (default on)
+  flowEngine?: FlowEngine;
+  showcaseSyncMinutes: number /* 0 = off */;
+  voice: VoiceSettings;
+};
 const DEFAULTS: Settings = { speed: "normal", showcaseSyncMinutes: 60, voice: { provider: "flow" } };
 export const SYNC_CHOICES = [0, 15, 30, 60, 180, 360] as const;
 const FILE = path.join(/* turbopackIgnore: true */ DATA_DIR, "settings.json");
@@ -56,8 +66,16 @@ export function updateSettings(patch: Partial<Settings>) {
   return next;
 }
 
+export const MAX_WORKERS = 20;
+
 /** How many Flow generations may run at the same time. */
-export const parallelLimit = () => SPEEDS.find((s) => s.id === getSettings().speed)?.parallel ?? 4;
+export const parallelLimit = () => {
+  const s = getSettings();
+  if (s.workers) return Math.min(MAX_WORKERS, Math.max(1, Math.round(s.workers)));
+  return SPEEDS.find((x) => x.id === s.speed)?.parallel ?? 4;
+};
+
+export const flowEngine = (): FlowEngine => getSettings().flowEngine ?? "auto";
 
 /**
  * Captcha browsers flow2api should keep: a captcha takes seconds while a generation takes minutes,

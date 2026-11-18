@@ -2,18 +2,19 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { CircleAlert, CircleCheck, Coins, Loader2, LogIn, RefreshCw, Trash2 } from "lucide-react";
+import { CircleAlert, CircleCheck, Coins, ExternalLink, Loader2, LogIn, RefreshCw, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { confirmDialog } from "@/components/confirm-dialog";
 import { GoogleIcon } from "@/components/brand-icons";
-import { deleteGoogleAccount, pollGoogleConnect, startGoogleConnect, syncGoogleAccount } from "./actions";
+import { deleteGoogleAccount, openFlowForAccount, pollGoogleConnect, startGoogleConnect, syncGoogleAccount } from "./actions";
 
 type Account = { id: number; email: string; credits: number | null; status: "active" | "need_login" | "error"; lastError: string | null; lastSync: string | null };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function connect(accountId: number | undefined, onStep: (m: string) => void) {
-  const { loginId } = await startGoogleConnect(accountId);
+  const { loginId, engine } = await startGoogleConnect(accountId);
+  if (engine === "chromium") toast.info("Camoufox masih disiapkan, login kali ini memakai Chrome/Edge di komputer ini.");
   onStep("Langkah 1/3 · Login akun Google di jendela yang terbuka...");
   let last = "";
   for (;;) {
@@ -66,6 +67,12 @@ export function GoogleAccounts({ accounts, ready }: { accounts: Account[]; ready
       else toast.error(r.error);
     });
 
+  const openFlow = (a: Account) =>
+    run(`flow-${a.id}`, async () => {
+      await openFlowForAccount(a.id);
+      toast.info("Jendela Flow terbuka. Selesaikan pendaftaran/ketentuan Flow di sana, lalu tutup jendelanya.");
+    });
+
   const remove = (a: Account) =>
     run(`del-${a.id}`, async () => {
       if (!(await confirmDialog({ title: `Hapus ${a.email}?`, description: "Sesi login akun ini ikut dihapus dari Traktiva. Kamu bisa menambahkannya lagi nanti.", danger: true }))) return;
@@ -115,6 +122,9 @@ export function GoogleAccounts({ accounts, ready }: { accounts: Account[]; ready
                   {busy === `login-${a.id}` ? <Loader2 className="size-3.5 animate-spin" /> : <LogIn className="size-3.5" />} Login ulang
                 </button>
               )}
+              <button type="button" onClick={() => openFlow(a)} disabled={!!busy} className={btn} title="Buka Flow di browser akun ini (untuk pendaftaran pertama atau cek manual)">
+                {busy === `flow-${a.id}` ? <Loader2 className="size-3.5 animate-spin" /> : <ExternalLink className="size-3.5" />} Buka Flow
+              </button>
               <button type="button" onClick={() => remove(a)} disabled={!!busy} aria-label={`Hapus ${a.email}`} className={`${btn} text-muted-foreground hover:text-destructive`}>
                 <Trash2 className="size-3.5" />
               </button>

@@ -4,18 +4,20 @@ import { useEffect, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
-  ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, CircleAlert, Maximize2, Clapperboard, Clock, FolderOpen, ImagePlus, Images, Library, Loader2, PenLine, Plus, Sparkles, Trash2, Upload, Wand2, X,
+  ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, CircleAlert, Maximize2, Clapperboard, Clock, FolderOpen, ImagePlus, Images, Library, Loader2, PenLine, Plus, Sparkles, Store, Trash2, Upload, Wand2, X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { confirmDialog } from "@/components/confirm-dialog";
+import { askRun, type RunChoice, type RunEngine } from "@/components/run-dialog";
 import type { VideoProject } from "@/lib/db/schema";
 import { mediaUrl } from "@/lib/media-url";
 import { isSilent, presetById, projectName } from "@/lib/presets";
 import {
   addScene, aiWriteScenes, buildStoryboard, deleteProject, generateImages, moveScene, openProjectFolder, pickFromLibrary, removePhoto, removeScene,
-  renameProject, renderProject, saveProject, uploadPhotos, uploadSceneImage,
+  pickShowcaseProduct, renameProject, renderProject, saveProject, uploadPhotos, uploadSceneImage,
 } from "../project-actions";
 import { LibraryPicker } from "@/components/library-picker";
+import { ShowcasePicker } from "@/components/showcase-picker";
 import { usePersistentState } from "@/lib/use-persistent-state";
 import { TimelineEditor } from "./editor";
 import { openLightbox, type LightboxItem } from "@/components/media-lightbox";
@@ -23,6 +25,9 @@ import { voiceLine } from "@/lib/voice";
 import { SceneVoiceLine, usePlayer, VoicePanel, type ProjectVoiceState, type VoiceOption } from "./voice-panel";
 
 type Project = Omit<VideoProject, "updatedAt"> & { updatedAt: number };
+type RunDefaults = { workers: number; engine: RunEngine; accounts: number; ask: boolean; max: number };
+/** Ask workers + engine before a generation run (unless the user chose "don't ask again"). null = cancelled. */
+type AskRun = (kind: "gambar" | "video", jobs: number) => Promise<RunChoice | undefined | null>;
 
 const STEPS = ["Konsep", "Produk", "Gaya", "Storyboard", "Render", "Hasil"];
 const CLIP_SECS = [4, 6, 8, 10];
@@ -35,8 +40,9 @@ const seg = (on: boolean) =>
   `flex h-8 items-center justify-center rounded-md px-3 text-xs font-medium transition-colors ${on ? "bg-background text-foreground shadow-xs ring-1 ring-border" : "text-muted-foreground hover:text-foreground"}`;
 
 export function Wizard({
-  project: p, hasGoogle, voice, voices, hasCartesia,
-}: { project: Project; hasGoogle: boolean; voice: ProjectVoiceState; voices: VoiceOption[]; hasCartesia: boolean }) {
+  project: p, hasGoogle, voice, voices, hasCartesia, run,
+}: { project: Project; hasGoogle: boolean; voice: ProjectVoiceState; voices: VoiceOption[]; hasCartesia: boolean; run: RunDefaults }) {
+  const ask: AskRun = async (kind, jobs) => (run.ask ? askRun({ kind, jobs, ...run }) : undefined);
   const voiceLabel = voice.choice === "cartesia" ? `Cartesia · ${voice.voiceName ?? "suara pilihan"}` : voice.choice === "off" ? "tanpa suara" : "Bawaan Flow";
   const router = useRouter();
   const preset = presetById(p.presetId)!;
@@ -143,8 +149,8 @@ export function Wizard({
         {step === 1 && <StepConcept preset={preset} p={p} onNext={() => go(2)} />}
         {step === 2 && <StepProduct p={p} busy={busy} act={act} onNext={() => go(3)} />}
         {step === 3 && <StepStyle p={p} busy={busy} act={act} onDone={() => setStep(4)} />}
-        {step === 4 && <StepStoryboard key={p.updatedAt} p={p} busy={busy || running} act={act} ready={scenesReady} onNext={() => go(5)} voice={voice} voices={voices} hasCartesia={hasCartesia} />}
-        {step === 5 && <StepRender p={p} busy={busy || running} act={act} ready={scenesReady} onBack={() => go(4)} voiceLabel={voiceLabel} />}
+        {step === 4 && <StepStoryboard key={p.updatedAt} p={p} busy={busy || running} act={act} ready={scenesReady} onNext={() => go(5)} voice={voice} voices={voices} hasCartesia={hasCartesia} ask={ask} />}
+        {step === 5 && <StepRender p={p} busy={busy || running} act={act} ready={scenesReady} onBack={() => go(4)} voiceLabel={voiceLabel} ask={ask} />}
         {step === 6 && <StepResult p={p} />}
       </section>
     </div>
@@ -313,12 +319,26 @@ function StepProduct({ p, busy, act, onNext }: { p: Project; busy: boolean; act:
             )}
           </div>
           <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/webp" multiple hidden onChange={(e) => upload(e.target.files)} />
-          {p.product.photos.length < 3 && (
-            <button type="button" disabled={busy} onClick={() => setPicking(true)} className="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg border text-xs font-medium hover:bg-accent disabled:opacity-60">
-              <Library className="size-3.5" /> Ambil dari Pustaka (tanpa unggah ulang)
-            </button>
-          )}
-          <LibraryPicker open={picking} onClose={() => setPicking(false)} title="Pilih foto produk" onPick={(rel) => act(() => pickFromLibrary(p.id, rel, { kind: "photo" }), "Foto ditambahkan")} />
+          <button type="button" disabled={busy} onClick={() => setPicking(true)} className="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg border text-xs font-medium hover:bg-accent disabled:opacity-60">
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Store className="size-3.5" />} Ambil dari Etalase (nama, harga &amp; foto otomatis)
+          </button>
+          <ShowcasePicker
+            open={picking}
+            onClose={() => setPicking(false)}
+            onPick={(it) =>
+              act(async () => {
+                const t = toast.loading("Mengambil data & foto produk...");
+                try {
+                  const r = await pickShowcaseProduct(p.id, it.id);
+                  setDraft({ name: r.name, details: r.details, price: r.price }); // the form holds its own draft
+                  toast.success(`Produk dipasang · ${r.photos} foto${r.fromKalodata ? " dari galeri produk" : " dari sampul etalase"}`, { id: t });
+                } catch (e) {
+                  toast.dismiss(t);
+                  throw e;
+                }
+              })
+            }
+          />
         </div>
       </div>
     </Card>
@@ -506,8 +526,8 @@ function SceneMedia({ scene, kind, running, scenes }: { scene?: Scene; kind: "im
 }
 
 function StepStoryboard({
-  p, busy, act, ready, onNext, voice, voices, hasCartesia,
-}: { p: Project; busy: boolean; act: Act; ready: boolean; onNext: () => void; voice: ProjectVoiceState; voices: VoiceOption[]; hasCartesia: boolean }) {
+  p, busy, act, ready, onNext, voice, voices, hasCartesia, ask,
+}: { p: Project; busy: boolean; act: Act; ready: boolean; onNext: () => void; voice: ProjectVoiceState; voices: VoiceOption[]; hasCartesia: boolean; ask: AskRun }) {
   const router = useRouter();
   const player = usePlayer();
   const silentConcept = !!presetById(p.presetId)?.silent;
@@ -565,7 +585,15 @@ function StepStoryboard({
             {writing === "all" ? <Loader2 className="size-4 animate-spin" /> : <Wand2 className="size-4" />} {writing === "all" ? "AI menulis..." : "Tulis prompt dengan AI"}
           </button>
           {aiTodo.length > 0 && (
-            <button type="button" className={secondary} disabled={busy} onClick={() => saveThen(() => generateImages(p.id))}>
+            <button
+              type="button"
+              className={secondary}
+              disabled={busy}
+              onClick={async () => {
+                const choice = await ask("gambar", aiTodo.length);
+                if (choice !== null) saveThen(() => generateImages(p.id, undefined, choice));
+              }}
+            >
               <Sparkles className="size-4" /> {missing === p.scenes.length ? "Buat semua gambar (AI)" : `Buat ulang ${aiTodo.length} gambar AI`}
             </button>
           )}
@@ -693,7 +721,7 @@ function StepStoryboard({
   );
 }
 
-function StepRender({ p, busy, act, ready, onBack, voiceLabel }: { p: Project; busy: boolean; act: Act; ready: boolean; onBack: () => void; voiceLabel: string }) {
+function StepRender({ p, busy, act, ready, onBack, voiceLabel, ask }: { p: Project; busy: boolean; act: Act; ready: boolean; onBack: () => void; voiceLabel: string; ask: AskRun }) {
   const preset = presetById(p.presetId)!;
   const doneClips = p.scenes.filter((s) => s.clip).length;
   return (
@@ -703,7 +731,10 @@ function StepRender({ p, busy, act, ready, onBack, voiceLabel }: { p: Project; b
       footer={
         <>
           <button type="button" className={secondary} onClick={onBack}><ArrowLeft className="size-4" /> Storyboard</button>
-          <button type="button" className={primary} disabled={busy || !ready} onClick={() => act(() => renderProject(p.id), "Render masuk antrean")}>
+          <button type="button" className={primary} disabled={busy || !ready} onClick={async () => {
+            const choice = await ask("video", p.scenes.filter((s) => !s.clip).length || p.scenes.length);
+            if (choice !== null) act(() => renderProject(p.id, choice), "Render masuk antrean");
+          }}>
             {busy ? <Loader2 className="size-4 animate-spin" /> : <Clapperboard className="size-4" />} {doneClips ? "Lanjutkan render" : "Render video"}
           </button>
         </>

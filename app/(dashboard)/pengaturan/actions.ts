@@ -4,6 +4,8 @@ import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { deleteProfile, isProfileKey } from "@/lib/browser/camoufox";
+import { camoufoxStatus, installCamoufox } from "@/lib/browser/camoufox-install";
+import { engineStatus, installEngine, restartEngine, stopEngine } from "@/lib/engine/flow2api-engine";
 import { db } from "@/lib/db";
 import { googleAccounts } from "@/lib/db/schema";
 import { deleteFlowSession, refreshFlowCredits, upsertFlowSession } from "@/lib/flow2api";
@@ -106,7 +108,7 @@ export async function setSpeed(speed: string) {
   const { SPEEDS, updateSettings } = await import("@/lib/settings");
   const s = SPEEDS.find((x) => x.id === speed);
   if (!s) throw new Error("Pilihan kecepatan tidak dikenal.");
-  updateSettings({ speed: s.id });
+  updateSettings({ speed: s.id, workers: undefined }); // a preset replaces an exact worker count
   const { drainSlots } = await import("@/lib/video");
   drainSlots(); // queued jobs start right away when the limit went up
   refresh();
@@ -169,4 +171,44 @@ export async function previewCartesiaVoice(id: string) {
   if (!v.cartesiaKey) throw new Error("Masukkan API key Cartesia dulu.");
   const wav = await synthesize(v.cartesiaKey, "Halo! Ini contoh suaraku buat video jualan kamu. Cek keranjang kuning ya!", id, { speed: v.speed });
   return `data:audio/wav;base64,${wav.toString("base64")}`;
+}
+
+/** Start (or resume) the Camoufox download in the background. */
+export async function downloadCamoufox() {
+  void installCamoufox().catch(() => {});
+  return camoufoxStatus();
+}
+
+/** Video engine controls for the engine card. Install runs in the background; poll /api/engine. */
+export async function installVideoEngine() {
+  void installEngine().catch(() => {});
+  return engineStatus();
+}
+
+export async function restartVideoEngine() {
+  try {
+    await restartEngine();
+  } catch {} // the reason is shown from engineStatus().error
+  revalidatePath("/pengaturan");
+  return engineStatus();
+}
+
+export async function stopVideoEngine() {
+  await stopEngine();
+  return engineStatus();
+}
+
+/** Visible Flow window on the account's own browser profile (first-run setup, checking things by hand). */
+export async function openFlowForAccount(id: number) {
+  const a = await db.select().from(googleAccounts).where(eq(googleAccounts.id, Id.parse(id))).get();
+  if (!a) throw new Error("Akun tidak ditemukan");
+  const { openFlowWindow } = await import("@/lib/platforms/flow-browser");
+  await openFlowWindow(a.sessionKey);
+}
+
+/** Whether the "workers + engine" question is asked before every generation run. */
+export async function setAskWorkers(ask: boolean) {
+  const { updateSettings } = await import("@/lib/settings");
+  updateSettings({ askWorkers: z.boolean().parse(ask) });
+  refresh();
 }

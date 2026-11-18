@@ -5,6 +5,11 @@ import { db } from "@/lib/db";
 import { googleAccounts } from "@/lib/db/schema";
 import { loadFlow2ApiConfig } from "@/lib/flow2api";
 import { captchaBrowsersFor, getSettings, parallelLimit, SPEEDS } from "@/lib/settings";
+import { camoufoxStatus, installCamoufox } from "@/lib/browser/camoufox-install";
+import { findChromium } from "@/lib/browser/chromium";
+import { BrowserEngine } from "./browser-engine";
+import { EngineCard } from "./engine-card";
+import { engineStatus } from "@/lib/engine/flow2api-engine";
 import { GoogleAccounts } from "./google-accounts";
 import { SpeedSetting } from "./speed-setting";
 import { VoiceSetting } from "./voice-setting";
@@ -16,6 +21,8 @@ export const dynamic = "force-dynamic";
 const fmt = new Intl.DateTimeFormat("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" });
 
 export default async function PengaturanPage() {
+  // First run: start the one-time Camoufox download as soon as the settings page is opened.
+  if (camoufoxStatus().state === "missing") void installCamoufox().catch(() => {});
   const accounts = await db.select().from(googleAccounts).orderBy(googleAccounts.email);
   const active = accounts.filter((a) => a.status === "active").length;
   // voice-over settings (the key itself never leaves the server; only a masked form is shown)
@@ -30,6 +37,10 @@ export default async function PengaturanPage() {
       </PageHeader>
 
       <div className="w-full flex-1 space-y-5">
+        <EngineCard initial={await engineStatus()} />
+
+        <BrowserEngine initial={{ camoufox: camoufoxStatus(), fallback: findChromium()?.name ?? null }} />
+
         <GoogleAccounts
           ready={!!loadFlow2ApiConfig()}
           accounts={accounts.map((a) => ({
@@ -47,6 +58,8 @@ export default async function PengaturanPage() {
           current={getSettings().speed}
           recommended={active >= 10 ? "maksimal" : active >= 3 ? "kencang" : "normal"}
           browsers={captchaBrowsersFor(parallelLimit())}
+          workers={getSettings().workers ?? null}
+          ask={getSettings().askWorkers !== false}
         />
 
         <VoiceSetting

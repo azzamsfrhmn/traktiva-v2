@@ -6,10 +6,11 @@ import ffmpegPath from "ffmpeg-static";
 import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { videoProjects, type ProjectScene, type VideoProject } from "@/lib/db/schema";
-import { generateFlowImage, generateFlowVideo, type Progress } from "@/lib/flow2api";
+import type { Progress } from "@/lib/flow2api";
+import { makeFlowImage, makeFlowVideo } from "@/lib/flow-engine";
+import { flowEngine, getSettings, type FlowEngine } from "@/lib/settings";
 import { synthesize } from "@/lib/cartesia";
 import { mediaDataUrl, mixVoiceOver, resolveMedia, saveResult, writeMedia } from "@/lib/media";
-import { getSettings } from "@/lib/settings";
 import { projectVoice, spoken, voiceLine, withoutVoice } from "@/lib/voice";
 import { isSilent } from "@/lib/presets";
 import { withSlot } from "@/lib/video";
@@ -31,7 +32,7 @@ const CLIP_GUARD =
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 300);
 
 // Errors that will not fix themselves by trying again (retrying would only burn credits).
-const PERMANENT = /kredit|credit|sesi akun google habis|login ulang|policy|kebijakan|safety|blocked|diblokir|tidak pantas|invalid prompt|API key|ditolak \(4(01|03)\)/i;
+const PERMANENT = /kredit|credit|sesi akun google habis|login ulang|buka flow|aktivitas tidak biasa|policy|kebijakan|safety|blocked|diblokir|tidak pantas|invalid prompt|API key|ditolak \(4(01|03)\)/i;
 const BACKOFF_S = [5, 10, 20, 30];
 
 /**
@@ -96,13 +97,13 @@ function sceneStore(id: number, scenes: ProjectScene[], kind: "Gambar" | "Klip",
 }
 
 /** Generate scene images. `only` = a single scene index (re-roll); otherwise every scene. */
-export function queueImages(id: number, only?: number) {
-  return start(id, () => runImages(id, only));
+export function queueImages(id: number, only?: number, engine: FlowEngine = flowEngine()) {
+  return start(id, () => runImages(id, only, engine));
 }
 
 /** Generate missing clips, then join them into final.mp4. */
-export function queueRender(id: number) {
-  return start(id, () => runRender(id));
+export function queueRender(id: number, engine: FlowEngine = flowEngine()) {
+  return start(id, () => runRender(id, engine));
 }
 
 async function start(id: number, task: () => Promise<void>) {
@@ -137,7 +138,7 @@ async function eachScene(
   return targets.filter((i) => store.scenes[i].state === "failed").length;
 }
 
-async function runImages(id: number, only?: number) {
+async function runImages(id: number, only: number | undefined, engine: FlowEngine) {
   const p = await load(id);
   if (!p) return;
   const refs = await Promise.all(p.product.photos.slice(0, 3).map(mediaDataUrl));
@@ -150,7 +151,7 @@ async function runImages(id: number, only?: number) {
     // product photos keep the product exact; a style frame (from a reference video) guides the shot
     const style = store.scenes[i].styleRef ? [await mediaDataUrl(store.scenes[i].styleRef!).catch(() => null)].filter(Boolean) as string[] : [];
     const sceneRefs = [...refs.slice(0, style.length ? 2 : 3), ...style];
-    const url = await withRetry(() => generateFlowImage(`${store.scenes[i].imagePrompt} ${IMAGE_GUARD}`, sceneRefs, onStage), onStage);
+    const url = await withRetry(() => makeFlowImage(engine, `${store.scenes[i].imagePrompt} ${IMAGE_GUARD}`, sceneRefs, onStage), onStage);
     onStage("Menyimpan gambar...", 97);
     // new name each time so the browser never shows a cached older take
     const image = await saveResult(url, `${p.folder}/gambar/adegan-${i + 1}-${now().toString(36)}`, ".png");
@@ -164,7 +165,7 @@ async function runImages(id: number, only?: number) {
   });
 }
 
-async function runRender(id: number) {
+async function runRender(id: number, engine: FlowEngine) {
   const p = await load(id);
   if (!p) return;
   if (p.scenes.some((s) => !s.image)) throw new Error("Semua adegan perlu gambar dulu.");
@@ -183,7 +184,7 @@ async function runRender(id: number) {
     const line = voiceLine(s.motionPrompt);
     const motion = cartesia ? `${withoutVoice(s.motionPrompt)} No one speaks: no talking, no voice-over, no lip-sync; only soft natural ambient sound.` : s.motionPrompt;
     const frame = await mediaDataUrl(s.image!);
-    const url = await withRetry(() => generateFlowVideo(model, `${motion} ${CLIP_GUARD}`, onStage, [frame]), onStage);
+    const url = await withRetry(() => makeFlowVideo(engine, { model, sec: p.clipSec }, `${motion} ${CLIP_GUARD}`, [frame], onStage), onStage);
     onStage("Mengunduh klip...", 95);
     const stamp = now().toString(36);
     const raw = await saveResult(url, `${p.folder}/klip/adegan-${i + 1}-${stamp}`, ".mp4");

@@ -1,7 +1,8 @@
 import { desc, eq, gte } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { googleAccounts, videoProjects } from "@/lib/db/schema";
-import { loadFlow2ApiConfig } from "@/lib/flow2api";
+import { camoufoxStatus, type CamoufoxStatus } from "@/lib/browser/camoufox-install";
+import { engineStatus } from "@/lib/engine/flow2api-engine";
 import { presetById, projectName } from "@/lib/presets";
 import { slotStats } from "@/lib/video";
 
@@ -23,25 +24,27 @@ export type Task = {
 };
 export type Finished = { key: string; title: string; href: string; ok: boolean; at: number };
 export type AppStatus = {
-  engine: "online" | "offline" | "missing";
+  engine: "online" | "offline" | "missing" | "installing" | "starting" | "failed";
   tokens: number | null;
   slots: { active: number; waiting: number; max: number };
   google: { active: number; total: number; credits: number };
+  camoufox: CamoufoxStatus;
   tasks: Task[];
   finished: Finished[];
   now: number;
 };
 
-async function engineState() {
-  const cfg = loadFlow2ApiConfig();
-  if (!cfg) return { engine: "missing" as const, tokens: null };
-  try {
-    const res = await fetch(`${cfg.baseUrl}/health`, { signal: AbortSignal.timeout(1500) });
-    const j = await res.json();
-    return { engine: res.ok ? ("online" as const) : ("offline" as const), tokens: Number(j.active_tokens ?? 0) };
-  } catch {
-    return { engine: "offline" as const, tokens: null }; // started on demand by the next generation
+async function engineState(): Promise<{ engine: AppStatus["engine"]; tokens: number | null }> {
+  const e = await engineStatus();
+  if (e.state === "running") {
+    try {
+      const j = await fetch(`${e.url}/health`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json());
+      return { engine: "online", tokens: Number(j.active_tokens ?? 0) };
+    } catch {}
+    return { engine: "online", tokens: null };
   }
+  const map = { missing: "missing", installing: "installing", starting: "starting", failed: "failed", stopped: "offline" } as const;
+  return { engine: map[e.state], tokens: null }; // "offline" = started on demand by the next generation
 }
 
 // Everything the bottom status bar shows, in one cheap call (polled every few seconds).
@@ -88,6 +91,7 @@ export async function GET() {
     ...engine,
     slots: slotStats(),
     google: { active: active.length, total: google.length, credits: active.reduce((n, g) => n + (g.credits ?? 0), 0) },
+    camoufox: camoufoxStatus(),
     tasks,
     finished,
     now: Date.now(),
