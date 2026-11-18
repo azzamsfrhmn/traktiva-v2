@@ -8,17 +8,16 @@ import { z } from "zod";
 import { db } from "@/lib/db";
 import { accounts, googleAccounts, showcaseProducts, videoProjects, type ProjectScene } from "@/lib/db/schema";
 import fs from "node:fs/promises";
-import { createProjectFolder, probeMedia, removeMedia, resolveMedia, saveResult, writeMedia } from "@/lib/media";
-import { parseKaloNumber } from "@/lib/kalodata/client";
+import { createProjectFolder, probeMedia, removeMedia, resolveMedia, writeMedia } from "@/lib/media";
+import { saveShowcasePhotos, showcaseMaterial } from "@/lib/showcase-material";
 import { aiAdjustEdit, exportEdit, prepareEdit } from "@/lib/editor";
 import { clamp, round2, type ProjectEdit } from "@/lib/edit";
-import { defaultOptions, draftCaption, presetById, projectName } from "@/lib/presets";
+import { buildVideos, defaultOptions, draftCaption, presetById, projectName, videoCount } from "@/lib/presets";
 import { addToLibrary, copyIntoProject, listGenerated, listUploads } from "@/lib/library";
 import { queueImages, queueRender } from "@/lib/projects";
 import { writeScenes } from "@/lib/prompt-writer";
 import { synthesize } from "@/lib/cartesia";
-import { FLOW_ENGINES, getSettings, MAX_WORKERS, updateSettings, type FlowEngine } from "@/lib/settings";
-import { drainSlots } from "@/lib/video";
+import { getSettings, maxVideosPerProduct } from "@/lib/settings";
 import { spoken } from "@/lib/voice";
 
 const Id = z.number().int().positive();
@@ -32,17 +31,6 @@ async function get(id: number) {
 async function requireGoogle() {
   const a = await db.select({ id: googleAccounts.id }).from(googleAccounts).where(eq(googleAccounts.status, "active")).limit(1);
   if (!a.length) throw new Error("Tambahkan akun Google di Pengaturan AI dulu.");
-}
-
-// Answer of the "before generating" dialog: concurrent workers + engine. Saved as the new defaults
-// (workers are app-wide generation slots); "remember" stops the dialog from asking again.
-const RunInput = z.object({ workers: z.number().int().min(1).max(MAX_WORKERS), engine: z.enum(FLOW_ENGINES), remember: z.boolean() });
-function applyRun(run?: z.input<typeof RunInput>): FlowEngine | undefined {
-  if (!run) return undefined;
-  const r = RunInput.parse(run);
-  updateSettings({ workers: r.workers, flowEngine: r.engine, ...(r.remember ? { askWorkers: false } : {}) });
-  drainSlots(); // queued jobs start right away when the limit went up
-  return r.engine;
 }
 
 export async function createProject(presetId: string) {
@@ -61,7 +49,7 @@ const Patch = z.object({
   title: z.string().trim().min(1).max(120).optional(),
   product: z.object({ name: z.string().max(200), details: z.string().max(1000), price: z.string().max(60) }).optional(),
   options: z.record(z.string(), z.string().max(300)).optional(),
-  clipSec: z.number().int().min(4).max(10).optional(),
+  clipSec: z.number().int().min(3).max(15).optional(),
   scenes: z.array(z.object({ label: z.string().max(60), imagePrompt: z.string().max(2000), motionPrompt: z.string().max(2000) })).max(MAX_SCENES).optional(),
   caption: z.string().max(2200).optional(),
 });
@@ -98,10 +86,14 @@ export async function buildStoryboard(id: number) {
   const preset = presetById(p.presetId);
   if (!preset) throw new Error("Konsep tidak dikenal.");
   if (!p.product.name.trim()) throw new Error("Isi nama produk dulu.");
-  const scenes = preset.scenes(p.product, p.options).map((s) => ({ ...s, image: null, clip: null, error: null }));
+  // ready-made concepts: 1–4 finished videos, each ONE continuous clip of clipSec seconds (1 image + 1 clip)
+  // with its own angle and talking points; Racikan Sendiri keeps its scenes as written
+  const drafts = preset.scenes(p.product, p.options);
+  const options = preset.custom ? p.options : { ...p.options, mode: "videos" };
+  const scenes = (preset.custom ? drafts : buildVideos(drafts, p.clipSec, p.options, p.product, Math.min(videoCount(p.options), maxVideosPerProduct()))).map((s) => ({ ...s, image: null, clip: null, error: null }));
   await db
     .update(videoProjects)
-    .set({ scenes, caption: p.caption || draftCaption(p.product), step: 4, updatedAt: new Date() })
+    .set({ scenes, options, finalPath: null, caption: p.caption || draftCaption(p.product), step: 4, updatedAt: new Date() })
     .where(eq(videoProjects.id, p.id));
 }
 
@@ -130,7 +122,7 @@ export async function removePhoto(id: number, rel: string) {
   await db.update(videoProjects).set({ product: { ...p.product, photos: p.product.photos.filter((x) => x !== rel) }, updatedAt: new Date() }).where(eq(videoProjects.id, p.id));
 }
 
-export async function generateImages(id: number, only?: number, run?: z.input<typeof RunInput>) {
+export async function generateImages(id: number, only?: number) {
   const p = await get(id);
   if (p.status === "running") throw new Error("Proyek sedang diproses.");
   if (!p.product.photos.length && !presetById(p.presetId)?.custom) throw new Error("Unggah minimal 1 foto produk.");
@@ -138,17 +130,17 @@ export async function generateImages(id: number, only?: number, run?: z.input<ty
   const targets = only != null ? [p.scenes[only]] : p.scenes.filter((s) => !(s.own && s.image));
   if (targets.some((s) => !s?.imagePrompt.trim())) throw new Error("Isi prompt gambar dulu untuk adegan yang mau dibuat AI.");
   await requireGoogle();
-  await queueImages(p.id, only, applyRun(run));
+  await queueImages(p.id, only);
 }
 
-export async function renderProject(id: number, run?: z.input<typeof RunInput>) {
+export async function renderProject(id: number) {
   const p = await get(id);
   if (p.status === "running") throw new Error("Proyek sedang diproses.");
   if (p.scenes.some((s) => !s.image)) throw new Error("Semua adegan perlu gambar dulu.");
   if (p.scenes.some((s) => !s.motionPrompt.trim())) throw new Error("Isi prompt gerak untuk semua adegan dulu.");
   await requireGoogle();
   await db.update(videoProjects).set({ step: 5 }).where(eq(videoProjects.id, p.id));
-  await queueRender(p.id, applyRun(run));
+  await queueRender(p.id);
 }
 
 export async function deleteProject(id: number, withFiles: boolean) {
@@ -470,46 +462,32 @@ export async function listShowcaseForPick(): Promise<ShowcasePick[]> {
   }));
 }
 
+
+/** Photos a showcase product offers, so the user can choose which ones the AI uses as reference. */
+export async function showcaseGallery(showcaseId: number) {
+  const m = await showcaseMaterial(showcaseId);
+  return { gallery: m.gallery, fromKalodata: m.fromKalodata };
+}
+
 /**
- * Use a showcase product as the project's product: name, price and short details, plus up to 3 photos.
- * Photos come from Kalodata's gallery for the same TikTok product id (several angles, plain backgrounds)
- * and fall back to the showcase cover when Kalodata has none / isn't logged in. Replaces earlier photos.
+ * Use a showcase product as the project's product: name, price, short details and the chosen photos
+ * (1–3 from showcaseGallery; the first 3 when none are given). Replaces earlier product photos.
  */
-export async function pickShowcaseProduct(id: number, showcaseId: number) {
+export async function pickShowcaseProduct(id: number, showcaseId: number, chosen?: string[]) {
   const p = await get(id);
   notRunning(p);
-  const row = await db.select().from(showcaseProducts).where(eq(showcaseProducts.id, Id.parse(showcaseId))).get();
-  if (!row) throw new Error("Produk etalase tidak ditemukan. Sinkronkan etalase dulu.");
+  const { row, gallery, facts, fromKalodata } = await showcaseMaterial(showcaseId);
+  // only photos that really belong to this product (never arbitrary URLs/paths from the client)
+  const pick = (chosen?.length ? chosen.filter((c) => gallery.includes(c)) : gallery).slice(0, 3);
+  if (chosen?.length && !pick.length) throw new Error("Foto yang dipilih tidak ditemukan lagi. Buka produknya ulang.");
 
-  // Kalodata detail (cached 24 h): gallery + facts. Optional: the showcase alone is enough to continue.
-  let images: string[] = [];
-  const facts: string[] = [];
-  try {
-    const { kaloDetail } = await import("@/app/(dashboard)/kalodata/actions");
-    const d = await kaloDetail(row.productId, "ID");
-    images = d.images ?? [];
-    const sold = parseKaloNumber(d.total?.sale);
-    const soldSpoken = sold >= 1_000_000 ? `lebih dari ${Math.floor(sold / 1_000_000)} juta` : sold >= 1000 ? `lebih dari ${Math.floor(sold / 1000)} ribu` : sold ? String(sold) : "";
-    if (d.info?.brand_name) facts.push(`brand ${d.info.brand_name}`);
-    if (d.info?.product_rating != null) facts.push(`rating ${d.info.product_rating}`);
-    if (soldSpoken) facts.push(`terjual ${soldSpoken} dalam 30 hari`);
-  } catch {}
-  if (row.shopName) facts.push(`toko ${row.shopName}`);
-  if (row.originalPrice && row.originalPrice !== row.price) facts.push(`harga normal ${row.originalPrice}`);
-  facts.push(...row.labels);
-
-  const stamp = Date.now().toString(36);
-  const photos: string[] = [];
-  for (const [i, src] of images.slice(0, 3).entries()) {
-    const rel = await saveResult(src, `${p.folder}/produk/etalase-${stamp}-${i + 1}`, ".png").catch(() => null);
-    if (rel) photos.push(rel);
-  }
-  if (!photos.length && row.cover) photos.push(await copyIntoProject(row.cover, `${p.folder}/produk/etalase-${stamp}-1`));
-  if (!photos.length) throw new Error("Produk ini belum punya foto. Sinkronkan etalase lagi atau unggah foto sendiri.");
+  const photos = await saveShowcasePhotos(p.folder, pick);
+  if (!photos.length) throw new Error("Foto produk gagal diambil. Coba lagi atau unggah foto sendiri.");
 
   for (const old of p.product.photos) await removeMedia(old).catch(() => {});
   const name = row.title.length > 120 ? `${row.title.slice(0, 117)}...` : row.title;
-  const product = { ...p.product, name, price: row.price, details: [...new Set(facts)].join(", ").slice(0, 1000), photos };
-  await db.update(videoProjects).set({ product, updatedAt: new Date() }).where(eq(videoProjects.id, p.id));
-  return { photos: photos.length, fromKalodata: images.length > 0, name: product.name, price: product.price, details: product.details };
+  const product = { ...p.product, name, price: row.price, details: facts.join(", ").slice(0, 1000), photos };
+  // productId: the TikTok Shop product, so posting can attach it to the yellow basket automatically
+  await db.update(videoProjects).set({ product, options: { ...p.options, productId: row.productId }, updatedAt: new Date() }).where(eq(videoProjects.id, p.id));
+  return { photos: photos.length, fromKalodata, name: product.name, price: product.price, details: product.details };
 }

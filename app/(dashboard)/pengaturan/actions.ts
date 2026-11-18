@@ -104,15 +104,6 @@ export async function deleteGoogleAccount(id: number) {
 
 // ---------- speed ----------
 
-export async function setSpeed(speed: string) {
-  const { SPEEDS, updateSettings } = await import("@/lib/settings");
-  const s = SPEEDS.find((x) => x.id === speed);
-  if (!s) throw new Error("Pilihan kecepatan tidak dikenal.");
-  updateSettings({ speed: s.id, workers: undefined }); // a preset replaces an exact worker count
-  const { drainSlots } = await import("@/lib/video");
-  drainSlots(); // queued jobs start right away when the limit went up
-  refresh();
-}
 
 // ---------- voice-over (Flow / Cartesia / ElevenLabs) ----------
 
@@ -204,11 +195,4 @@ export async function openFlowForAccount(id: number) {
   if (!a) throw new Error("Akun tidak ditemukan");
   const { openFlowWindow } = await import("@/lib/platforms/flow-browser");
   await openFlowWindow(a.sessionKey);
-}
-
-/** Whether the "workers + engine" question is asked before every generation run. */
-export async function setAskWorkers(ask: boolean) {
-  const { updateSettings } = await import("@/lib/settings");
-  updateSettings({ askWorkers: z.boolean().parse(ask) });
-  refresh();
 }

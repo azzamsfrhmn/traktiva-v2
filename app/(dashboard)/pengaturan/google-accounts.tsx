@@ -85,12 +85,12 @@ export function GoogleAccounts({ accounts, ready }: { accounts: Account[]; ready
         <div className="flex items-center gap-2.5">
           <span className="grid size-9 place-items-center rounded-lg border bg-background"><GoogleIcon className="size-5" /></span>
           <div>
-          <p className="text-sm font-semibold">Akun Google</p>
+          <p className="text-sm font-semibold">Akun Google Flow</p>
           <p className="text-xs text-muted-foreground">Login sekali, lalu video dibuat otomatis memakai kredit Flow akun ini.</p>
           </div>
         </div>
         <button type="button" onClick={() => login()} disabled={!!busy || !ready} title={ready ? undefined : "Mesin video belum terpasang"} className="flex h-8 items-center gap-1.5 rounded-lg border bg-background px-3 text-xs font-medium shadow-xs hover:bg-accent disabled:opacity-60">
-          {busy === "login-new" ? <Loader2 className="size-3.5 animate-spin" /> : <GoogleIcon className="size-3.5" />} Tambah akun Google
+          {busy === "login-new" ? <Loader2 className="size-3.5 animate-spin" /> : <GoogleIcon className="size-3.5" />} Tambah akun Google Flow
         </button>
       </div>
 

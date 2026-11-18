@@ -24,7 +24,13 @@ async function viaApiThenBrowser<T>(engine: FlowEngine, api: () => Promise<T>, b
   } catch (e) {
     if (engine === "api" || !isEngineTrouble(e)) throw e;
     onStage("Mesin API bermasalah, pindah ke browser...", 5);
-    return browser();
+    try {
+      return await browser();
+    } catch (b) {
+      // both failed: lead with the API reason (usually the real cause), then what the browser hit
+      const why = (x: unknown) => (x instanceof Error ? x.message : String(x)).replace(/\s*\(asli:[^)]*\)/, "");
+      throw new Error(`API: ${why(e)} · Browser: ${why(b)}`, { cause: b });
+    }
   }
 }
 

@@ -6,13 +6,13 @@ import ffmpegPath from "ffmpeg-static";
 import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { videoProjects, type ProjectScene, type VideoProject } from "@/lib/db/schema";
-import type { Progress } from "@/lib/flow2api";
+import { syncFlowCreditsSoon, type Progress } from "@/lib/flow2api";
 import { makeFlowImage, makeFlowVideo } from "@/lib/flow-engine";
 import { flowEngine, getSettings, type FlowEngine } from "@/lib/settings";
 import { synthesize } from "@/lib/cartesia";
 import { mediaDataUrl, mixVoiceOver, resolveMedia, saveResult, writeMedia } from "@/lib/media";
 import { projectVoice, spoken, voiceLine, withoutVoice } from "@/lib/voice";
-import { isSilent } from "@/lib/presets";
+import { isSilent, isVideosMode, videoFile } from "@/lib/presets";
 import { withSlot } from "@/lib/video";
 
 // Project pipeline: product photos → one image per scene (Nano Banana) → one clip per scene image
@@ -106,6 +106,26 @@ export function queueRender(id: number, engine: FlowEngine = flowEngine()) {
   return start(id, () => runRender(id, engine));
 }
 
+/**
+ * One finished video end to end: scene images, then clips, then final.mp4. Resolves when the video is
+ * done or has failed (never throws), so a batch worker can await it and move on to the next product.
+ */
+export async function runFullVideo(id: number, engine: FlowEngine = flowEngine()) {
+  try {
+    await save(id, { status: "running", step: 4, progress: "Membuat gambar adegan...", error: null });
+    await runImages(id, undefined, engine);
+    const p = await load(id);
+    if (!p || p.status === "failed" || p.scenes.some((s) => !s.image)) {
+      if (p && p.status !== "failed") await save(id, { status: "failed", progress: null, error: "Ada gambar adegan yang gagal dibuat." });
+      return;
+    }
+    await save(id, { status: "running", step: 5, progress: "Membuat klip video..." });
+    await runRender(id, engine);
+  } catch (e) {
+    await save(id, { status: "failed", progress: null, error: errMsg(e) }).catch(() => {});
+  }
+}
+
 async function start(id: number, task: () => Promise<void>) {
   await save(id, { status: "running", progress: "Menyiapkan...", error: null });
   void task().catch((e) => save(id, { status: "failed", progress: null, error: errMsg(e) }));
@@ -129,6 +149,7 @@ async function eachScene(
         try {
           const result = await work(i, (line, pct) => void store.patch(i, pct == null ? { stage: line } : { stage: line, pct }));
           await store.patch(i, { ...result, state: "done", stage: null, pct: 100, finishedAt: now() }, true);
+          syncFlowCreditsSoon(); // Flow just spent credits: keep the shown balance current
         } catch (e) {
           await store.patch(i, { state: "failed", stage: null, pct: null, error: errMsg(e), finishedAt: now() }, true);
         }
@@ -195,12 +216,49 @@ async function runRender(id: number, engine: FlowEngine) {
     return { clip: await mixVoiceOver(raw, wav, `${p.folder}/klip/adegan-${i + 1}-${stamp}-vo.mp4`) };
   });
   await store.flush();
+
+  // "videos" mode: every clip IS a finished video → clean export of each (video-1.mp4 …), no joining.
+  // Finished ones are exported even when others failed, so they can already be used.
+  if (isVideosMode(p.options)) {
+    await save(id, { progress: "Menyiapkan video jadi..." });
+    let first: string | null = null;
+    for (const [i, sc] of store.scenes.entries()) {
+      if (!sc.clip) continue;
+      const out = videoFile(p.folder, i);
+      await remux(resolveMedia(sc.clip), resolveMedia(out), silent); // lossless: exactly Flow's quality
+      first ??= out;
+    }
+    if (failed) {
+      await save(id, { finalPath: first });
+      throw new Error(`${failed} video gagal dibuat. Render lagi untuk mencoba ulang (video yang sudah jadi tidak dibuat ulang).`);
+    }
+    await save(id, { status: "done", progress: null, error: null, finalPath: first, step: 6 });
+    return;
+  }
   if (failed) throw new Error(`${failed} klip gagal dibuat. Render lagi untuk mencoba ulang (klip yang sudah jadi tidak dibuat ulang).`);
 
   await save(id, { progress: "Menggabungkan klip..." });
   const finalPath = `${p.folder}/final.mp4`;
   await concat(store.scenes.map((s) => resolveMedia(s.clip!)), resolveMedia(finalPath), silent);
   await save(id, { status: "done", progress: null, error: null, finalPath, step: 6 });
+}
+
+/**
+ * Clean export of ONE clip without re-encoding: video/audio streams are copied bit for bit (no quality
+ * loss, no extra compression), only the container is rewritten: vendor tags/creation times dropped,
+ * faststart for upload. Silent concepts drop the audio stream.
+ */
+export async function remux(file: string, out: string, silent: boolean) {
+  if (!ffmpegPath) throw new Error("ffmpeg tidak tersedia di perangkat ini.");
+  await run(ffmpegPath, [
+    "-y", "-i", file,
+    "-map", "0:v:0", ...(silent ? ["-an"] : ["-map", "0:a:0?"]),
+    "-c", "copy",
+    "-map_metadata", "-1", "-map_chapters", "-1",
+    "-metadata:s:v:0", "handler_name=VideoHandler", ...(silent ? [] : ["-metadata:s:a:0", "handler_name=SoundHandler"]),
+    "-fflags", "+bitexact",
+    "-movflags", "+faststart", out,
+  ], { windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
 }
 
 /** Join clips with ffmpeg (re-encode so clips with slightly different params still join cleanly). */
@@ -211,8 +269,9 @@ export async function concat(files: string[], out: string, silent: boolean) {
   try {
     await run(ffmpegPath, [
       "-y", "-f", "concat", "-safe", "0", "-i", list,
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-      ...(silent ? ["-an"] : ["-c:a", "aac", "-b:a", "160k"]),
+      // joining clips of different params needs a re-encode: keep it visually lossless (crf 16) so posts stay sharp
+      "-c:v", "libx264", "-preset", "medium", "-crf", "16", "-pix_fmt", "yuv420p",
+      ...(silent ? ["-an"] : ["-c:a", "aac", "-b:a", "192k"]),
       // clean export: drop container/stream tags carried over from the source clips (vendor handler names,
       // encoder strings, creation times, chapters) — like a normal "export" from a video editor
       "-map_metadata", "-1", "-map_chapters", "-1",

@@ -128,7 +128,7 @@ export function StatusBar() {
           <Cpu className="size-3" />
           <span className="hidden sm:inline">{s?.engine === "online" ? "Mesin siap" : s?.engine === "missing" ? "Mesin belum terpasang" : s?.engine === "installing" ? "Memasang mesin" : s?.engine === "starting" ? "Mesin menyala..." : s?.engine === "failed" ? "Mesin bermasalah" : "Mesin standby"}</span>
         </Item>
-        <Item title="Akun Google aktif dan total kredit Flow" href="/pengaturan">
+        <Item title="Akun Google Flow aktif dan total kredit Flow" href="/pengaturan">
           <GoogleIcon className="size-3" />
           {s ? `${s.google.active}/${s.google.total}` : "–"}
           <Coins className="ml-1 size-3" />
@@ -176,7 +176,7 @@ export function StatusBar() {
         <Item title={sound ? "Suara notifikasi aktif (klik untuk bisukan)" : "Suara notifikasi mati (klik untuk aktifkan)"} onClick={toggleSound}>
           {sound ? <Volume2 className="size-3" /> : <VolumeX className="size-3" />}
         </Item>
-        <Item title="Proses yang boleh jalan bersamaan (atur di Pengaturan AI → Kecepatan)" href="/pengaturan">
+        <Item title="Proses yang jalan bersamaan (otomatis sesuai PC dan jumlah akun Google Flow)" href="/pengaturan">
           <Layers className="size-3" />
           {s ? `${s.slots.active}/${s.slots.max}` : "–"}
           {s && s.slots.waiting > 0 && <span className="opacity-80">+{s.slots.waiting}</span>}

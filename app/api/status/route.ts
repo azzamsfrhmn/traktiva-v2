@@ -5,6 +5,7 @@ import { camoufoxStatus, type CamoufoxStatus } from "@/lib/browser/camoufox-inst
 import { engineStatus } from "@/lib/engine/flow2api-engine";
 import { presetById, projectName } from "@/lib/presets";
 import { slotStats } from "@/lib/video";
+import { setActiveFlowAccounts } from "@/lib/settings";
 
 export const dynamic = "force-dynamic";
 
@@ -87,6 +88,7 @@ export async function GET() {
   ].sort((a, b) => b.at - a.at).slice(0, 8);
 
   const active = google.filter((g) => g.status === "active");
+  setActiveFlowAccounts(active.length); // the automatic parallel limit follows the account count
   const body: AppStatus = {
     ...engine,
     slots: slotStats(),

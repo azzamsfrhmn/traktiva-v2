@@ -1,17 +1,10 @@
 import "server-only";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DATA_DIR } from "@/lib/db";
 
 // Small app preferences in DATA_DIR/settings.json (not worth a DB table).
-
-export const SPEEDS = [
-  { id: "hemat", parallel: 2, label: "Hemat", hint: "Paling aman untuk 1 akun Google. Ringan di PC." },
-  { id: "normal", parallel: 4, label: "Normal", hint: "Seimbang. Cocok untuk 1–2 akun Google." },
-  { id: "kencang", parallel: 10, label: "Kencang", hint: "Butuh ±3 akun Google aktif dan RAM 8 GB+." },
-  { id: "maksimal", parallel: 50, label: "Maksimal", hint: "Untuk banyak akun Google. PC berat, risiko limit akun lebih tinggi." },
-] as const;
-export type SpeedId = (typeof SPEEDS)[number]["id"];
 
 export const VOICE_PROVIDERS = ["flow", "cartesia", "elevenlabs"] as const;
 export type VoiceProvider = (typeof VOICE_PROVIDERS)[number];
@@ -26,14 +19,12 @@ type VoiceSettings = {
 export const FLOW_ENGINES = ["auto", "api", "browser"] as const;
 export type FlowEngine = (typeof FLOW_ENGINES)[number];
 type Settings = {
-  speed: SpeedId;
-  workers?: number; // exact concurrent workers chosen in the "before generating" dialog; overrides the speed preset
-  askWorkers?: boolean; // ask workers + engine every time generation starts (default on)
+  videoWorkers?: number; // batch: how many finished videos are made at the same time (last choice)
   flowEngine?: FlowEngine;
   showcaseSyncMinutes: number /* 0 = off */;
   voice: VoiceSettings;
 };
-const DEFAULTS: Settings = { speed: "normal", showcaseSyncMinutes: 60, voice: { provider: "flow" } };
+const DEFAULTS: Settings = { showcaseSyncMinutes: 60, voice: { provider: "flow" } };
 export const SYNC_CHOICES = [0, 15, 30, 60, 180, 360] as const;
 const FILE = path.join(/* turbopackIgnore: true */ DATA_DIR, "settings.json");
 
@@ -66,14 +57,37 @@ export function updateSettings(patch: Partial<Settings>) {
   return next;
 }
 
-export const MAX_WORKERS = 20;
+/** Batch: at most this many videos are made at the same time (1 worker = 1 finished video). */
+export const MAX_VIDEO_WORKERS = 10;
 
-/** How many Flow generations may run at the same time. */
-export const parallelLimit = () => {
-  const s = getSettings();
-  if (s.workers) return Math.min(MAX_WORKERS, Math.max(1, Math.round(s.workers)));
-  return SPEEDS.find((x) => x.id === s.speed)?.parallel ?? 4;
-};
+// ---------- how many Flow generations run at once: automatic, per device ----------
+// No setting to pick: the limit follows this PC (RAM/CPU: each running job keeps captcha browsers and
+// downloads busy) and the number of active Google Flow accounts (more jobs per account = limits/captcha).
+
+const PER_ACCOUNT = 4; // jobs per active Flow account that stay clear of rate limits
+const MAX_PARALLEL = 20; // flow2api caps its captcha browser pool at 20
+const ga = globalThis as unknown as { __flowAccounts?: number };
+
+/** Kept current by the slot queue and the status poll (lib/video, app/api/status). */
+export const setActiveFlowAccounts = (n: number) => void (ga.__flowAccounts = n);
+export const activeFlowAccounts = () => ga.__flowAccounts ?? 1;
+
+/** What this PC can carry: ~1 job per GB of RAM above 4 GB for the OS and apps, never more than CPU threads. */
+export function deviceCapacity() {
+  const ramGb = os.totalmem() / 2 ** 30;
+  const cores = os.cpus().length || 2;
+  return { ramGb, cores, jobs: Math.max(2, Math.min(MAX_PARALLEL, Math.floor(ramGb - 4), cores)) };
+}
+
+/**
+ * How many different videos one product may get in one go on this device (Gaya "Jumlah video", batch
+ * "Video per produk"): the variants of a product are made at the same time, so a PC that can only run 2
+ * jobs at once is offered 2. Capped at 4 (the number of variants that exist).
+ */
+export const maxVideosPerProduct = () => Math.max(1, Math.min(4, parallelLimit()));
+
+/** How many Flow generations (scene images/clips, across all videos) may run at the same time. */
+export const parallelLimit = () => Math.max(2, Math.min(deviceCapacity().jobs, PER_ACCOUNT * Math.max(1, activeFlowAccounts())));
 
 export const flowEngine = (): FlowEngine => getSettings().flowEngine ?? "auto";
 
