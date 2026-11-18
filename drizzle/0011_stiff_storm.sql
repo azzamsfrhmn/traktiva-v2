@@ -1,0 +1,1 @@
+ALTER TABLE `kalo_sessions` ADD `extra_cookies` text;

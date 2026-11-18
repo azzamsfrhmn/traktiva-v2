@@ -1,0 +1,349 @@
+import "server-only";
+import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { captchaBrowsersFor, parallelLimit } from "@/lib/settings";
+
+// Client for a local flow2api instance (https://github.com/TheSmallHanCat/flow2api, MIT):
+// admin API to register Google/Flow sessions, OpenAI-compatible API to generate.
+// Users never configure it: Traktiva reads flow2api's own config and starts it when needed.
+
+export type Flow2ApiConfig = { baseUrl: string; apiKey: string; adminUser: string; adminPass: string };
+
+// ponytail: dev install path; the packaged app will ship flow2api (or its TS port) as a sidecar and set FLOW2API_DIR
+const FLOW2API_DIR = process.env.FLOW2API_DIR || "C:\\BOT\\flow2api";
+
+/** Read connection details from env (overrides) or flow2api's config/setting.toml. */
+export function loadFlow2ApiConfig(): Flow2ApiConfig | null {
+  let toml = "";
+  try {
+    toml = fs.readFileSync(path.join(FLOW2API_DIR, "config", "setting.toml"), "utf8");
+  } catch {}
+  const val = (key: string) => toml.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m"))?.[1];
+  const port = toml.match(/^\s*port\s*=\s*(\d+)/m)?.[1] ?? "8000";
+  const host = val("host") === "0.0.0.0" || !val("host") ? "127.0.0.1" : val("host");
+  const cfg = {
+    baseUrl: (process.env.FLOW2API_URL || `http://${host}:${port}`).replace(/\/+$/, ""),
+    apiKey: process.env.FLOW2API_API_KEY || val("api_key") || "",
+    adminUser: process.env.FLOW2API_ADMIN_USER || val("admin_username") || "",
+    adminPass: process.env.FLOW2API_ADMIN_PASS || val("admin_password") || "",
+  };
+  return cfg.apiKey && cfg.adminUser && cfg.adminPass ? cfg : null;
+}
+
+const healthy = (cfg: Flow2ApiConfig) =>
+  fetch(`${cfg.baseUrl}/health`, { signal: AbortSignal.timeout(3000) }).then((r) => r.ok, () => false);
+
+// One start attempt at a time across concurrent callers.
+const gs = globalThis as unknown as { __flowStart?: Promise<void> | null; __flowCapacity?: { want: number; done: Promise<void> } };
+
+/** Start flow2api from its install folder if it isn't answering yet (detached, logs to flow2api.log). */
+async function ensureRunning(cfg: Flow2ApiConfig) {
+  if (await healthy(cfg)) return;
+  gs.__flowStart ??= (async () => {
+    const python = path.join(FLOW2API_DIR, ".venv", "Scripts", "python.exe");
+    if (!fs.existsSync(python)) throw new Error("Mesin video belum terpasang di perangkat ini.");
+    const log = fs.openSync(path.join(FLOW2API_DIR, "flow2api.log"), "a");
+    const child = spawn(python, ["main.py"], {
+      cwd: FLOW2API_DIR,
+      detached: true,
+      windowsHide: true,
+      stdio: ["ignore", log, log],
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    });
+    child.unref();
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (await healthy(cfg)) return;
+    }
+    throw new Error("Mesin video tidak bisa dinyalakan. Coba lagi sebentar.");
+  })().finally(() => (gs.__flowStart = null));
+  await gs.__flowStart;
+}
+
+export async function requireFlow2Api() {
+  const cfg = loadFlow2ApiConfig();
+  if (!cfg) throw new Error("Mesin video belum terpasang di perangkat ini.");
+  await ensureRunning(cfg);
+  const want = captchaBrowsersFor(parallelLimit());
+  if (gs.__flowCapacity?.want !== want) {
+    gs.__flowCapacity = {
+      want,
+      done: ensureCaptchaCapacity(cfg, want).catch(() => {
+        gs.__flowCapacity = undefined; // try again on the next request
+      }),
+    };
+  }
+  await gs.__flowCapacity?.done;
+  return cfg;
+}
+
+/** Browser-captcha mode solves one captcha at a time per browser; size flow2api's pool to the speed setting (kept in its DB). */
+async function ensureCaptchaCapacity(cfg: Flow2ApiConfig, want: number) {
+  const conf = await admin(cfg, "/api/captcha/config");
+  if (conf.captcha_method !== "browser" || Number(conf.browser_count) === want) return;
+  await admin(cfg, "/api/captcha/config", { method: "POST", body: JSON.stringify({ ...conf, browser_count: want }) });
+}
+
+async function req(url: string, init: RequestInit & { timeoutMs?: number } = {}) {
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(init.timeoutMs ?? 30_000) });
+  const text = await res.text();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- flow2api JSON
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {}
+  if (!res.ok) throw new Error(`flow2api ${res.status}: ${json?.detail ?? json?.error?.message ?? text.slice(0, 200)}`);
+  return json;
+}
+
+// Admin session token, cached per process (flow2api keeps it in memory until it restarts).
+const g = globalThis as unknown as { __flowAdmin?: { base: string; token: string } };
+
+async function adminToken(cfg: Flow2ApiConfig, fresh = false) {
+  if (!fresh && g.__flowAdmin?.base === cfg.baseUrl) return g.__flowAdmin.token;
+  const j = await req(`${cfg.baseUrl}/api/admin/login`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: cfg.adminUser, password: cfg.adminPass }),
+  });
+  g.__flowAdmin = { base: cfg.baseUrl, token: j.token };
+  return j.token as string;
+}
+
+/** Admin call with one automatic re-login (flow2api forgets admin sessions on restart). */
+async function admin(cfg: Flow2ApiConfig, path: string, init: RequestInit = {}) {
+  const call = async (fresh: boolean) =>
+    req(`${cfg.baseUrl}${path}`, {
+      ...init,
+      headers: { "content-type": "application/json", authorization: `Bearer ${await adminToken(cfg, fresh)}`, ...(init.headers ?? {}) },
+    });
+  try {
+    return await call(false);
+  } catch (e) {
+    if (e instanceof Error && /flow2api 401/.test(e.message)) return call(true);
+    throw e;
+  }
+}
+
+/** Connectivity + credentials check used by the settings page. */
+export async function checkFlow2Api(cfg: Flow2ApiConfig) {
+  const health = await req(`${cfg.baseUrl}/health`, { timeoutMs: 8000 });
+  await adminToken(cfg, true); // validates admin user/pass
+  const models = await req(`${cfg.baseUrl}/v1/models`, { headers: { authorization: `Bearer ${cfg.apiKey}` } }); // validates API key
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- flow2api JSON
+  const videoModels = (models.data ?? []).map((m: any) => String(m.id)).filter((id: string) => /^(veo|omni)-/.test(id));
+  return { activeTokens: Number(health.active_tokens ?? 0), captcha: String(health.captcha_method ?? ""), videoModels: videoModels.length };
+}
+
+export type BrowserCookie = { name: string; value: string; domain: string; path: string; expires: number; httpOnly: boolean; secure: boolean; sameSite?: string };
+
+/** Register (or refresh) a Google/Flow session in flow2api. Returns the flow2api token id, email and credits. */
+export async function upsertFlowSession(input: { tokenId?: number | null; st: string; cookies: BrowserCookie[]; remark: string }) {
+  const cfg = await requireFlow2Api();
+  const body = JSON.stringify({ st: input.st, google_cookies: JSON.stringify(input.cookies), remark: input.remark, video_enabled: true, image_enabled: true });
+  if (input.tokenId) {
+    await admin(cfg, `/api/tokens/${input.tokenId}`, { method: "PUT", body });
+    const credits = await refreshFlowCredits(input.tokenId).catch(() => null);
+    return { id: input.tokenId, email: null as string | null, credits };
+  }
+  const j = await admin(cfg, "/api/tokens", { method: "POST", body });
+  return { id: Number(j.token.id), email: (j.token.email as string) ?? null, credits: j.token.credits != null ? Number(j.token.credits) : null };
+}
+
+export async function refreshFlowCredits(tokenId: number) {
+  const cfg = await requireFlow2Api();
+  const j = await admin(cfg, `/api/tokens/${tokenId}/refresh-credits`, { method: "POST" });
+  return j.credits != null ? Number(j.credits) : null;
+}
+
+export async function deleteFlowSession(tokenId: number) {
+  const cfg = await requireFlow2Api();
+  await admin(cfg, `/api/tokens/${tokenId}`, { method: "DELETE" });
+}
+
+// flow2api streams Chinese status lines; show Indonesian for the common ones, drop the rest.
+const CJK = /[㐀-鿿]/;
+function humanize(line: string) {
+  // order matters: specific, known flow2api messages first (see flow2api src for the raw strings)
+  if (/queue wait timeout/i.test(line)) return "Antrean Flow penuh, dicoba lagi otomatis.";
+  if (/recaptcha/i.test(line)) return "Captcha Flow gagal (skor rendah), dicoba lagi otomatis.";
+  if (/没有可用的token|无可用|并发已满|concurren|No available (projects|token)/i.test(line)) return "Semua akun Flow sedang sibuk (slot penuh), dicoba lagi otomatis.";
+  if (/浏览器启动冷却|没有可用的浏览器|标签页不可用|cooldown/i.test(line)) return "Browser verifikasi Flow belum siap, dicoba lagi otomatis.";
+  if (/AT无效|刷新失败|Token validation failed/i.test(line)) return "Token Flow sedang diperbarui, dicoba lagi otomatis.";
+  if (/请重新同步|未返回已登录账号|login required|unauthori[sz]ed|\b401\b|Token not found/i.test(line)) return "Sesi akun Google habis. Sinkron atau login ulang akunnya.";
+  if (/credit|余额|insufficient/i.test(line)) return "Kredit Flow tidak cukup.";
+  if (/429|quota|rate limit/i.test(line)) return "Kuota/limit akun Flow tercapai, dicoba lagi otomatis.";
+  return CJK.test(line) ? null : line;
+}
+
+export type ChatContent = string | ({ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } })[];
+
+/** Streamed chat completion against flow2api (generation takes minutes). Returns the full assistant text. */
+async function flowChat(model: string, content: ChatContent, onProgress?: Progress) {
+  const cfg = await requireFlow2Api();
+  const res = await fetch(`${cfg.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${cfg.apiKey}` },
+    body: JSON.stringify({ model, messages: [{ role: "user", content }], stream: true }),
+    signal: AbortSignal.timeout(30 * 60_000),
+  });
+  if (!res.ok || !res.body) throw new Error(`flow2api ${res.status}: ${(await res.text()).slice(0, 300)}`);
+
+  let out = "";
+  let buffer = "";
+  const decoder = new TextDecoder();
+  // Flow is silent between "submitted" and "done" (images ~30-60 s, videos report % only every ~20 s),
+  // so creep the bar slowly; real checkpoints only ever push it forward.
+  let pct = 0;
+  let text = "Sedang dibuat di Flow...";
+  const report = (t: string, p?: number) => {
+    text = t;
+    if (p != null) pct = Math.max(pct, p);
+    onProgress?.(text, pct);
+  };
+  const creep = setInterval(() => pct >= 28 && pct < 92 && report(text, pct + (model.startsWith("omni") ? 1 : 3)), 3000); // ponytail: fixed guess, tune if bars stall/finish early
+  try {
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) continue;
+      const data = line.slice(5).trim();
+      if (data === "[DONE]") continue;
+      try {
+        const j = JSON.parse(data);
+        if (j.error) {
+          const msg = String(j.error.message ?? JSON.stringify(j.error));
+          throw new Error(withRaw(humanize(msg), msg), { cause: msg });
+        }
+        const status: string = j.choices?.[0]?.delta?.reasoning_content ?? "";
+        if (status.trim()) {
+          const st = stage(status);
+          report(st.text, st.pct);
+        }
+        const piece: string = j.choices?.[0]?.delta?.content ?? j.choices?.[0]?.message?.content ?? "";
+        if (piece) {
+          out += piece;
+          const last = piece.trim().split("\n").filter(Boolean).at(-1);
+          if (last && !last.startsWith("<") && !last.startsWith("![")) report(humanize(last)?.slice(0, 160) ?? "Sedang dibuat di Flow...");
+        }
+      } catch (e) {
+        if (e instanceof Error && !(e instanceof SyntaxError)) throw e;
+      }
+    }
+  }
+  } finally {
+    clearInterval(creep);
+  }
+  return out;
+}
+
+/** "Terjemahan · (asli: …)" so the user-facing text stays clear but the real flow2api cause isn't lost. */
+function withRaw(human: string | null, raw: string) {
+  const r = raw.replace(/\s+/g, " ").trim().slice(0, 80);
+  return human && human !== raw ? `${human} (asli: ${r})` : r;
+}
+
+function failReason(out: string) {
+  const lines = out.trim().split("\n").filter(Boolean);
+  const human = lines.map(humanize).filter(Boolean).at(-1) ?? null;
+  return withRaw(human, lines.at(-1) ?? "respons kosong").slice(0, 300);
+}
+
+export type Progress = (line: string, pct?: number) => void;
+
+/**
+ * flow2api's own (Chinese) stage lines → short Indonesian status + a rough percentage.
+ * Stages give fixed checkpoints; for videos flow2api also streams "生成进度: N%" (an elapsed-time estimate).
+ */
+function stage(line: string): { text: string; pct?: number } {
+  const t = line.trim();
+  const video = t.match(/生成进度[:：]\s*(\d{1,3})%/);
+  if (video) return { text: "Video sedang dibuat di Flow...", pct: Math.max(32, Math.min(94, Number(video[1]))) };
+  const up = t.match(/上传第\s*(\d+)\s*\/\s*(\d+)/);
+  if (up) return { text: `Mengunggah foto acuan ${up[1]}/${up[2]}...`, pct: 10 + Math.round((10 * Number(up[1])) / Number(up[2])) };
+  if (/上传完成/.test(t)) return { text: "Foto acuan terunggah, verifikasi captcha...", pct: 22 };
+  if (/打码|captcha/i.test(t)) return { text: "Verifikasi captcha & mengirim ke Flow...", pct: 28 };
+  if (/链接|下载|缓存|返回/.test(t)) return { text: "Mengambil hasil...", pct: 95 };
+  if (/初始化/.test(t)) return { text: "Menyiapkan...", pct: 8 };
+  if (/启动/.test(t)) return { text: "Tugas dimulai...", pct: 4 };
+  return { text: humanize(t)?.slice(0, 160) ?? "Sedang dibuat di Flow..." };
+}
+
+/**
+ * flow2api's captcha browser sometimes wedges after running for a long time; every request then fails with
+ * "Failed to obtain reCAPTCHA token" until the process restarts. Restart it (once, shared by all concurrent
+ * requests) and retry. Requests that were cut off by someone else's restart also retry instead of failing.
+ * ponytail: Windows-only restart (finds the PID by port); other OSes just surface the error.
+ */
+const rs = globalThis as unknown as { __flowRestart?: { gen: number; running: Promise<void> | null } };
+rs.__flowRestart ??= { gen: 0, running: null };
+
+async function withCaptchaRetry<T>(fn: () => Promise<T>, onProgress?: Progress) {
+  const state = rs.__flowRestart!;
+  const gen = state.gen;
+  try {
+    return await fn();
+  } catch (e) {
+    if (process.platform !== "win32" || !(e instanceof Error)) throw e;
+    const raw = `${e.message} ${String(e.cause ?? "")}`;
+    if (state.gen !== gen || state.running) {
+      // another request restarted flow2api while we were waiting; just wait for it and go again
+      await state.running;
+    } else if (/queue wait timeout/i.test(raw)) {
+      // flow2api was busy, not broken: wait a little and try again (no restart, it would kill other jobs)
+      onProgress?.("Antrean Flow penuh, mencoba lagi...");
+      await new Promise((r) => setTimeout(r, 5000));
+    } else if (/obtain reCAPTCHA token/i.test(raw)) {
+      onProgress?.("Captcha macet, menyalakan ulang mesin video...");
+      await restartFlow2Api();
+    } else throw e;
+    return fn();
+  }
+}
+
+export function restartFlow2Api() {
+  const state = rs.__flowRestart!;
+  state.running ??= (async () => {
+    state.gen++;
+    const cfg = loadFlow2ApiConfig();
+    if (!cfg) return;
+    const port = new URL(cfg.baseUrl).port || "80";
+    const { execFileSync } = await import("node:child_process");
+    const netstat = execFileSync("netstat", ["-ano", "-p", "TCP"], { encoding: "utf8", windowsHide: true });
+    const pid = netstat.split("\n").map((l) => l.trim().split(/\s+/)).find((c) => c[1]?.endsWith(`:${port}`) && c[3] === "LISTENING")?.[4];
+    if (pid && pid !== "0") {
+      try {
+        execFileSync("taskkill", ["/PID", pid, "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      } catch {}
+    }
+    for (let i = 0; i < 10 && (await healthy(cfg)); i++) await new Promise((r) => setTimeout(r, 500));
+    g.__flowAdmin = undefined; // admin sessions die with the process
+    await ensureRunning(cfg);
+  })().finally(() => (state.running = null));
+  return state.running;
+}
+
+const withRefs = (prompt: string, refs: string[]): ChatContent =>
+  refs.length ? [{ type: "text", text: prompt }, ...refs.map((url) => ({ type: "image_url" as const, image_url: { url } }))] : prompt;
+
+/** Video (text-to-video, or reference mode when refs are data URLs). Returns the result URL. */
+export async function generateFlowVideo(model: string, prompt: string, onProgress?: Progress, refs: string[] = []) {
+  const out = await withCaptchaRetry(() => flowChat(model, withRefs(prompt, refs), onProgress), onProgress);
+  const url = out.match(/<video[^>]*\ssrc=['"]([^'"]+)['"]/i)?.[1] ?? out.match(/https?:\/\/[^\s'")]+\.mp4[^\s'")]*/i)?.[0];
+  if (!url) throw new Error(`Flow gagal membuat video: ${failReason(out)}`, { cause: out });
+  return url;
+}
+
+export const FLOW_IMAGE_MODEL = "gemini-3.1-flash-image-portrait"; // Nano Banana, 9:16
+
+/** Image (Nano Banana) using product photos as references. Returns an http(s) URL or a data URL. */
+export async function generateFlowImage(prompt: string, refs: string[], onProgress?: Progress) {
+  const out = await withCaptchaRetry(() => flowChat(FLOW_IMAGE_MODEL, withRefs(prompt, refs), onProgress), onProgress);
+  const url = out.match(/!\[[^\]]*\]\(([^)\s]+)\)/)?.[1] ?? out.match(/<img[^>]*\ssrc=['"]([^'"]+)['"]/i)?.[1];
+  if (!url) throw new Error(`Flow gagal membuat gambar: ${failReason(out)}`, { cause: out });
+  return url;
+}

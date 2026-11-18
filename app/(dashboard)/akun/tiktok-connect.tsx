@@ -1,0 +1,104 @@
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Loader2, Plus } from "lucide-react";
+import { toast } from "sonner";
+import { PlatformIcon } from "@/components/platform-icon";
+import { PLATFORMS } from "@/lib/db/schema";
+import { PLATFORM } from "@/lib/platforms";
+import { pollTikTokLogin, startTikTokLogin, syncTikTokAccount } from "./actions";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Opens a Camoufox login window (server side), polls until the user logs in, then pulls the profile.
+ * accountId = re-login an existing account on its own browser profile.
+ */
+export async function connectTikTok(accountId?: number, onStep?: (msg: string) => void) {
+  const { loginId } = await startTikTokLogin(accountId);
+  onStep?.("Silakan login di jendela TikTok yang terbuka...");
+  for (;;) {
+    await sleep(1500);
+    const s = await pollTikTokLogin(loginId);
+    if (s.status === "identifying") onStep?.("Login terdeteksi, mengenali akun...");
+    if (s.status === "done") {
+      onStep?.(`@${s.username} tersambung, mengambil data profil...`);
+      await syncTikTokAccount(s.accountId).catch(() => {}); // profile sync is best-effort; login already saved
+      return s;
+    }
+    if (s.status === "failed" || s.status === "cancelled") throw new Error(s.error || "Login gagal");
+  }
+}
+
+function useConnectTikTok() {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  async function connect() {
+    setBusy(true);
+    const t = toast.loading("Membuka jendela login TikTok...");
+    try {
+      const s = await connectTikTok(undefined, (msg) => toast.loading(msg, { id: t }));
+      toast.success(s.created ? `@${s.username} tersambung` : `Sesi @${s.username} diperbarui`, { id: t });
+      router.refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Login gagal", { id: t });
+    } finally {
+      setBusy(false);
+    }
+  }
+  return { busy, connect };
+}
+
+// Platforms with a working login flow; the rest show as "Segera".
+const READY = new Set(["tiktok"]);
+
+export function TikTokConnectButton() {
+  const { busy, connect } = useConnectTikTok();
+  return (
+    <button
+      type="button"
+      onClick={connect}
+      disabled={busy}
+      className="flex h-8 items-center gap-2 rounded-lg bg-primary px-3 text-[13px] font-medium text-primary-foreground shadow-xs hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      {busy ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
+      {busy ? "Menunggu login..." : "Hubungkan TikTok"}
+    </button>
+  );
+}
+
+/** "Add account" tile at the end of the grid: one row per platform. */
+export function ConnectTile() {
+  const { busy, connect } = useConnectTikTok();
+  return (
+    <div className="flex min-h-56 flex-col rounded-xl border border-dashed bg-card/40 p-4">
+      <div className="flex items-center gap-2">
+        <span className="grid size-8 place-items-center rounded-lg bg-primary/10 text-brand-light"><Plus className="size-4" /></span>
+        <div>
+          <p className="text-[13px] font-semibold">Hubungkan akun baru</p>
+          <p className="text-xs text-muted-foreground">Login sekali, data akun terisi otomatis.</p>
+        </div>
+      </div>
+      <div className="mt-3 grid flex-1 grid-cols-2 gap-1.5">
+        {PLATFORMS.map((p) => {
+          const ready = READY.has(p);
+          return (
+            <button
+              key={p}
+              type="button"
+              disabled={!ready || busy}
+              onClick={connect}
+              title={ready ? `Hubungkan ${PLATFORM[p].label}` : "Segera hadir"}
+              className="flex items-center gap-2 rounded-lg border bg-background px-2.5 py-2 text-left text-xs font-medium hover:border-ring/40 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-background"
+            >
+              {busy && p === "tiktok" ? <Loader2 className="size-4 animate-spin" /> : <PlatformIcon platform={p} className="size-4" />}
+              {PLATFORM[p].label}
+              {!ready && <span className="ml-auto text-[10px] font-normal text-muted-foreground">Segera</span>}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
