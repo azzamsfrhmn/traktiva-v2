@@ -3,11 +3,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
-  CaseUpper, Copy, Download, FolderOpen, Loader2, Music, Pause, Play, Plus, Redo2, Scissors, Sparkles, Trash2, Type, Undo2, Upload, Volume2, VolumeX, Wand2,
+  CaseUpper, Copy, Download, Frame, FolderOpen, Loader2, Music, Pause, Play, Plus, Redo2, Scissors, Sparkles, Trash2, Type, Undo2, Upload, Volume2, VolumeX, Wand2,
 } from "lucide-react";
 import { toast } from "sonner";
 import type { VideoProject } from "@/lib/db/schema";
-import { autoCaptions, CAPTION_PRESETS, clamp, drawCaption, round2, uid, type CaptionStyle, type EditCaption, type ProjectEdit } from "@/lib/edit";
+import {
+  autoCaptions, blitCaption, CAPTION_ANIMS, CAPTION_PRESETS, clamp, drawCaption, normalizeEdit, round2, SAFE_PRESETS, styleOf, uid,
+  type Box, type CaptionAnim, type CaptionPos, type CaptionStyle, type EditCaption, type ProjectEdit, type SafeArea,
+} from "@/lib/edit";
 import { mediaUrl } from "@/lib/media-url";
 import { voiceLine } from "@/lib/voice";
 import { aiEditTimeline, exportTimeline, openEditor, openProjectFolder, saveEdit, saveProject, uploadMusic } from "../project-actions";
@@ -30,6 +33,7 @@ const patchOf = (e: ProjectEdit) => ({
   voiceVolume: e.voiceVolume,
   captions: e.captions,
   captionStyle: e.captionStyle,
+  safe: e.safe,
   voices: e.voices.map(({ id, start, speed, volume }) => ({ id, start, speed, volume })),
   bgm: e.bgm,
 });
@@ -129,14 +133,18 @@ export function TimelineEditor({ p }: { p: Project }) {
   const router = useRouter();
   const [opening, setOpening] = useState(!p.edit);
   const [openError, setOpenError] = useState<string | null>(null);
-  const { edit, version, get, set, commit, reset, undo, redo, canUndo, canRedo } = useHistory(p.edit ?? null);
+  const { edit, version, get, set, commit, reset, undo, redo, canUndo, canRedo } = useHistory(p.edit ? normalizeEdit(p.edit) : null);
   const [sel, setSel] = useState<Sel>(null);
   const [tab, setTab] = useState<Tab>("teks");
   const [playing, setPlaying] = useState(false);
   const [zoom, setZoom] = useState(0); // px per second; 0 = fit
   const [busy, setBusy] = useState<"export" | "ai" | "music" | null>(null);
   const [exportedV, setExportedV] = useState(p.edit?.exportedAt ? 0 : -1); // history version last exported
-  const [activeCap, setActiveCap] = useState<string | null>(null);
+  const [hit, setHit] = useState<{ id: string; box: Box } | null>(null); // caption on screen (drag target)
+  const [guide, setGuide] = useState(false); // centre line while dragging
+  const [showSafe, setShowSafe] = useState(true);
+  const capCache = useRef<{ key: string; canvas: HTMLCanvasElement; box: Box } | null>(null);
+  const stage = useRef<HTMLDivElement>(null);
 
   const video = useRef<HTMLVideoElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -189,8 +197,28 @@ export function TimelineEditor({ p }: { p: Project }) {
       const on = !v.paused && !v.ended;
       if (playhead.current) playhead.current.style.transform = `translateX(${t * pps}px)`;
       if (timeLabel.current) timeLabel.current.textContent = `${fmt(t)} / ${fmt(e.duration)}`;
-      const cap = e.captions.find((c) => t >= c.start && t < c.end)?.id ?? null;
-      setActiveCap((cur) => (cur === cap ? cur : cap));
+      // caption layer: rendered once per text/style into an offscreen canvas, then animated per frame
+      const cv = canvas.current;
+      if (cv) {
+        const ctx = cv.getContext("2d")!;
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        const c = e.captions.find((x) => t >= x.start && t < x.end && x.text.trim());
+        let shown: { id: string; box: Box } | null = null;
+        if (c) {
+          const st = styleOf(e.captionStyle, c);
+          const key = JSON.stringify([c.text, st, e.safe, cv.width, cv.height]);
+          if (capCache.current?.key !== key) {
+            const off = capCache.current?.canvas ?? document.createElement("canvas");
+            off.width = cv.width; // also clears it
+            off.height = cv.height;
+            capCache.current = { key, canvas: off, box: drawCaption(off.getContext("2d")!, off.width, off.height, c.text, st, e.safe) };
+          }
+          // paused = show the caption fully (for editing); playing = with its entrance animation
+          blitCaption(ctx, capCache.current.canvas, capCache.current.box, cv.height, st.anim, on ? t - c.start : 99);
+          shown = { id: c.id, box: capCache.current.box };
+        }
+        setHit((cur) => (cur?.id === shown?.id && cur?.box === shown?.box ? cur : shown));
+      }
       // follow the playhead while playing
       const sc = scroller.current;
       if (on && sc && (t * pps > sc.scrollLeft + sc.clientWidth - 60 || t * pps < sc.scrollLeft)) sc.scrollLeft = t * pps - 40;
@@ -216,16 +244,6 @@ export function TimelineEditor({ p }: { p: Project }) {
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [pps, gains, get]);
-
-  // live caption preview on a canvas the size of the video (same drawing as the export)
-  const cap = edit?.captions.find((c) => c.id === activeCap);
-  useEffect(() => {
-    const c = canvas.current;
-    if (!c || !edit) return;
-    const ctx = c.getContext("2d")!;
-    ctx.clearRect(0, 0, c.width, c.height);
-    if (cap) drawCaption(ctx, c.width, c.height, cap.text, edit.captionStyle);
-  }, [cap, edit]);
 
   const now = () => video.current?.currentTime ?? 0;
   const seek = (t: number) => {
@@ -271,6 +289,65 @@ export function TimelineEditor({ p }: { p: Project }) {
     if (!next.length) return toast.error("Belum ada naskah suara untuk dijadikan caption.");
     set((e) => ({ ...e, captions: next }));
     toast.success(`${next.length} caption dibuat dari naskah`);
+  };
+
+  /** Position/size edits go to the caption's own pos when it has one, otherwise to the shared style. */
+  const setPos = (id: string | null, patch: Partial<CaptionPos>, record = true) =>
+    set((e) => {
+      const c = id ? e.captions.find((x) => x.id === id) : null;
+      if (c?.pos) return { ...e, captions: e.captions.map((x) => (x.id === c.id ? { ...x, pos: { ...c.pos!, ...patch } } : x)) };
+      return { ...e, captionStyle: { ...e.captionStyle, ...patch } };
+    }, record);
+
+  /** Drag on the preview: pointer offset in px of the stage; one undo step per drag. */
+  const dragStage = (ev: React.PointerEvent, onMove: (dx: number, dy: number, rect: DOMRect, e: PointerEvent) => void) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const rect = stage.current!.getBoundingClientRect();
+    const x0 = ev.clientX, y0 = ev.clientY;
+    const move = (e: PointerEvent) => onMove(e.clientX - x0, e.clientY - y0, rect, e);
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setGuide(false);
+      commit();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+  const moveCaption = (ev: React.PointerEvent) => {
+    if (!hit || !edit) return;
+    const { id, box } = hit;
+    setSel({ kind: "caption", id });
+    setTab("teks");
+    // start from where the text is drawn (the style may be pushed in by the safe area)
+    const cx = (box.x + box.w / 2) / edit.width, cy = (box.y + box.h / 2) / edit.height;
+    dragStage(ev, (dx, dy, rect) => {
+      let x = clamp(cx + dx / rect.width, 0.02, 0.98);
+      const centred = Math.abs(x - 0.5) < 0.015;
+      if (centred) x = 0.5;
+      setGuide(centred);
+      setPos(id, { x: round2(x), y: round2(clamp(cy + dy / rect.height, 0.02, 0.98)) }, false);
+    });
+  };
+  const resizeCaption = (ev: React.PointerEvent) => {
+    if (!hit || !edit) return;
+    const { id, box } = hit;
+    const c = edit.captions.find((x) => x.id === id);
+    const size0 = styleOf(edit.captionStyle, c).size;
+    const rect = stage.current!.getBoundingClientRect();
+    const k = rect.width / edit.width;
+    const ccx = rect.left + (box.x + box.w / 2) * k, ccy = rect.top + (box.y + box.h / 2) * k;
+    const d0 = Math.max(8, Math.hypot(ev.clientX - ccx, ev.clientY - ccy));
+    dragStage(ev, (_dx, _dy, _r, e) => setPos(id, { size: Math.round(clamp((size0 * Math.hypot(e.clientX - ccx, e.clientY - ccy)) / d0, 0.03, 0.12) * 1000) / 1000 }, false));
+  };
+  /** Replay the animation: jump just before the selected (or next) caption and play. */
+  const previewAnim = () => {
+    const c = (sel?.kind === "caption" && edit?.captions.find((x) => x.id === sel.id)) || edit?.captions.find((x) => x.end > now()) || edit?.captions[0];
+    if (!c || !video.current) return;
+    seek(Math.max(0, c.start - 0.15));
+    gains.wake();
+    void video.current.play();
   };
 
   // keyboard: space play/pause, delete, ctrl+z / ctrl+shift+z, s = split
@@ -324,12 +401,12 @@ export function TimelineEditor({ p }: { p: Project }) {
       const fctx = full.getContext("2d")!;
       const overlays = edit.captions.filter((c) => c.text.trim()).map((c) => {
         fctx.clearRect(0, 0, W, H);
-        const box = drawCaption(fctx, W, H, c.text, edit.captionStyle);
+        const box = drawCaption(fctx, W, H, c.text, styleOf(edit.captionStyle, c), edit.safe);
         const crop = document.createElement("canvas");
         crop.width = Math.max(1, box.w);
         crop.height = Math.max(1, box.h);
         crop.getContext("2d")!.drawImage(full, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
-        return { start: c.start, end: c.end, x: box.x, y: box.y, png: crop.toDataURL("image/png") };
+        return { start: c.start, end: c.end, x: box.x, y: box.y, w: box.w, h: box.h, png: crop.toDataURL("image/png") };
       });
       await saveEdit(p.id, patchOf(edit));
       await exportTimeline(p.id, patchOf(edit), overlays);
@@ -401,9 +478,28 @@ export function TimelineEditor({ p }: { p: Project }) {
               onPlay={() => setPlaying(true)}
               onPause={() => setPlaying(false)}
               onEnded={() => setPlaying(false)}
-              onClick={toggle}
             />
             <canvas ref={canvas} width={edit.width} height={edit.height} className="pointer-events-none absolute inset-0 size-full" />
+            {/* interaction layer: click = play/pause, drag the caption to move it, corner dot = resize */}
+            <div ref={stage} className="absolute inset-0" onClick={toggle}>
+              {showSafe && <SafeGuides safe={edit.safe} />}
+              {guide && <div className="pointer-events-none absolute inset-y-0 left-1/2 w-px bg-fuchsia-400" />}
+              {hit && !playing && (
+                <div
+                  className={`group absolute cursor-move touch-none rounded-sm border border-dashed ${sel?.id === hit.id ? "border-white" : "border-transparent hover:border-white/70"}`}
+                  style={{ left: `${(hit.box.x / edit.width) * 100}%`, top: `${(hit.box.y / edit.height) * 100}%`, width: `${(hit.box.w / edit.width) * 100}%`, height: `${(hit.box.h / edit.height) * 100}%` }}
+                  onPointerDown={moveCaption}
+                  onClick={(ev) => ev.stopPropagation()}
+                  title="Seret untuk memindah caption"
+                >
+                  <span
+                    className={`absolute -right-1.5 -bottom-1.5 size-3 cursor-nwse-resize rounded-full border-2 border-primary bg-white ${sel?.id === hit.id ? "" : "hidden group-hover:block"}`}
+                    onPointerDown={resizeCaption}
+                    title="Tarik untuk mengubah ukuran"
+                  />
+                </div>
+              )}
+            </div>
             {edit.voices.map((v) => (
               <audio key={v.id} preload="auto" src={mediaUrl(v.src)} ref={(el) => void (el ? voiceEls.current.set(v.id, el) : voiceEls.current.delete(v.id))} />
             ))}
@@ -414,6 +510,9 @@ export function TimelineEditor({ p }: { p: Project }) {
               {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5" />} {playing ? "Jeda" : "Putar"}
             </button>
             <span ref={timeLabel} className="ml-2 font-mono text-[11px] tabular-nums text-muted-foreground">0:00.0 / {fmt(D)}</span>
+            <button type="button" className={`${secondary} ml-auto ${showSafe ? "border-primary bg-primary/10" : ""}`} onClick={() => setShowSafe((v) => !v)} title="Tampilkan area yang tertutup tombol & teks aplikasi">
+              <Frame className="size-3.5" /> Safe area
+            </button>
           </div>
         </div>
 
@@ -432,6 +531,10 @@ export function TimelineEditor({ p }: { p: Project }) {
               <TextPanel
                 style={edit.captionStyle}
                 onStyle={(s, record) => set((e) => ({ ...e, captionStyle: { ...e.captionStyle, ...s } }), record)}
+                onPos={(patch, record) => setPos(selCap?.id ?? null, patch, record)}
+                onAnim={(anim) => (set((e) => ({ ...e, captionStyle: { ...e.captionStyle, anim } })), previewAnim())}
+                safe={edit.safe}
+                onSafe={(s, record) => set((e) => ({ ...e, safe: { ...e.safe, ...s } }), record)}
                 selected={selCap}
                 onCaption={(patch, record) => selCap && updCaption(selCap.id, patch, record)}
                 onAdd={addCaption}
@@ -690,11 +793,15 @@ function Slider({
 }
 
 function TextPanel({
-  style, onStyle, selected, onCaption, onAdd, onRemove, onSplit, onRegen, count,
+  style, onStyle, onPos, onAnim, safe, onSafe, selected, onCaption, onAdd, onRemove, onSplit, onRegen, count,
 }: {
-  style: CaptionStyle; onStyle: (s: Partial<CaptionStyle>, record?: boolean) => void; selected?: EditCaption;
+  style: CaptionStyle; onStyle: (s: Partial<CaptionStyle>, record?: boolean) => void; onPos: (p: Partial<CaptionPos>, record?: boolean) => void;
+  onAnim: (a: CaptionAnim) => void; safe: SafeArea; onSafe: (s: Partial<SafeArea>, record?: boolean) => void; selected?: EditCaption;
   onCaption: (p: Partial<EditCaption>, record?: boolean) => void; onAdd: () => void; onRemove: () => void; onSplit: () => void; onRegen: () => void; count: number;
 }) {
+  const own = !!selected?.pos;
+  const pos = styleOf(style, selected);
+  const safePreset = SAFE_PRESETS.find((x) => (Object.keys(x.safe) as (keyof SafeArea)[]).every((k) => Math.abs(x.safe[k] - safe[k]) < 0.001))?.id;
   return (
     <div className="space-y-4">
       <div className="space-y-2">
@@ -707,12 +814,51 @@ function TextPanel({
             </button>
           ))}
         </div>
-        <Slider label="Ukuran" value={style.size} min={0.035} max={0.1} step={0.002} onChange={(v, r) => onStyle({ size: v }, r)} />
-        <Slider label="Posisi vertikal" value={style.y} min={0.1} max={0.9} step={0.01} onChange={(v, r) => onStyle({ y: v }, r)} />
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="mr-1 text-xs font-medium">Animasi masuk</span>
+          {CAPTION_ANIMS.map((x) => (
+            <button key={x.id} type="button" onClick={() => onAnim(x.id)} className={`h-7 rounded-full border px-2.5 text-[11px] ${style.anim === x.id ? "border-primary bg-primary/10 font-medium" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}>
+              {x.label}
+            </button>
+          ))}
+        </div>
         <button type="button" className={`${secondary} ${style.upper ? "border-primary bg-primary/10" : ""}`} onClick={() => onStyle({ upper: !style.upper })}>
           <CaseUpper className="size-3.5" /> HURUF BESAR
         </button>
       </div>
+
+      <div className="space-y-2 border-t pt-3">
+        <p className="text-xs font-medium">
+          Posisi & ukuran <span className="font-normal text-muted-foreground">· {own ? "khusus caption ini" : "semua caption"} — bisa juga diseret di video</span>
+        </p>
+        <Slider label="Ukuran" value={pos.size} min={0.03} max={0.12} step={0.002} onChange={(v, r) => onPos({ size: v }, r)} />
+        <Slider label="Posisi horizontal" value={pos.x} min={0.05} max={0.95} step={0.01} onChange={(v, r) => onPos({ x: v }, r)} />
+        <Slider label="Posisi vertikal" value={pos.y} min={0.05} max={0.95} step={0.01} onChange={(v, r) => onPos({ y: v }, r)} />
+        <div className="flex flex-wrap gap-1.5">
+          <button type="button" className={secondary} onClick={() => onPos({ x: 0.5 })}>Tengahkan</button>
+          <button type="button" className={secondary} onClick={() => onPos({ y: 0.2 })}>Atas</button>
+          <button type="button" className={secondary} onClick={() => onPos({ y: 0.5 })}>Tengah</button>
+          <button type="button" className={secondary} onClick={() => onPos({ y: 0.72 })}>Bawah</button>
+        </div>
+      </div>
+
+      <div className="space-y-2 border-t pt-3">
+        <p className="text-xs font-medium">Safe area <span className="font-normal text-muted-foreground">· teks tidak akan keluar dari kotak ini</span></p>
+        <div className="flex flex-wrap gap-1.5">
+          {SAFE_PRESETS.map((x) => (
+            <button key={x.id} type="button" onClick={() => onSafe(x.safe)} className={`h-7 rounded-full border px-2.5 text-[11px] ${safePreset === x.id ? "border-primary bg-primary/10 font-medium" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}>
+              {x.label}
+            </button>
+          ))}
+        </div>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+          <Slider label="Atas" value={safe.top} min={0} max={0.35} step={0.01} onChange={(v, r) => onSafe({ top: v }, r)} />
+          <Slider label="Bawah" value={safe.bottom} min={0} max={0.35} step={0.01} onChange={(v, r) => onSafe({ bottom: v }, r)} />
+          <Slider label="Kiri" value={safe.left} min={0} max={0.35} step={0.01} onChange={(v, r) => onSafe({ left: v }, r)} />
+          <Slider label="Kanan" value={safe.right} min={0} max={0.35} step={0.01} onChange={(v, r) => onSafe({ right: v }, r)} />
+        </div>
+      </div>
+
       <div className="space-y-2 border-t pt-3">
         {selected ? (
           <>
@@ -730,15 +876,34 @@ function TextPanel({
                 <input type="number" step={0.1} min={0} className={field} value={selected.end} onChange={(e) => onCaption({ end: round2(Number(e.target.value)) })} />
               </label>
             </div>
+            <label className="flex items-center gap-2 text-xs">
+              <input type="checkbox" checked={own} onChange={(e) => onCaption({ pos: e.target.checked ? { x: style.x, y: style.y, size: style.size } : null })} />
+              Posisi & ukuran sendiri <span className="text-muted-foreground">(mis. judul hook di atas)</span>
+            </label>
           </>
         ) : (
-          <p className="text-[11px] text-muted-foreground">Klik caption di timeline untuk mengedit teks & waktunya. Seret untuk memindah, tarik ujungnya untuk memanjangkan.</p>
+          <p className="text-[11px] text-muted-foreground">Klik caption di timeline atau di video untuk mengedit. Seret untuk memindah, tarik ujungnya untuk memanjangkan.</p>
         )}
         <div className="flex flex-wrap gap-2">
           <button type="button" className={secondary} onClick={onAdd}><Plus className="size-3.5" /> Caption di playhead</button>
           <button type="button" className={secondary} onClick={onRegen}><Wand2 className="size-3.5" /> Buat ulang dari naskah</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Dim the margins the app UI covers (top bar, side buttons, description) and outline the safe box. */
+function SafeGuides({ safe }: { safe: SafeArea }) {
+  const pct = (n: number) => `${n * 100}%`;
+  const dim = "absolute bg-black/45";
+  return (
+    <div className="pointer-events-none absolute inset-0">
+      <div className={`${dim} inset-x-0 top-0`} style={{ height: pct(safe.top) }} />
+      <div className={`${dim} inset-x-0 bottom-0`} style={{ height: pct(safe.bottom) }} />
+      <div className={`${dim} left-0`} style={{ top: pct(safe.top), bottom: pct(safe.bottom), width: pct(safe.left) }} />
+      <div className={`${dim} right-0`} style={{ top: pct(safe.top), bottom: pct(safe.bottom), width: pct(safe.right) }} />
+      <div className="absolute border border-dashed border-white/60" style={{ top: pct(safe.top), bottom: pct(safe.bottom), left: pct(safe.left), right: pct(safe.right) }} />
     </div>
   );
 }
@@ -750,7 +915,7 @@ function PresetSwatch({ style }: { style: CaptionStyle }) {
     if (!c) return;
     const ctx = c.getContext("2d")!;
     ctx.clearRect(0, 0, c.width, c.height);
-    drawCaption(ctx, c.width, c.height, "Aa Promo", { ...style, y: 0.5, size: 0.17 });
+    drawCaption(ctx, c.width, c.height, "Aa Promo", { ...style, x: 0.5, y: 0.5, size: 0.17 }, { top: 0, bottom: 0, left: 0, right: 0 });
   }, [style]);
   return <canvas ref={ref} width={160} height={70} className="h-9 w-full rounded bg-[linear-gradient(135deg,#5b6b7a,#2a3440)]" />;
 }
@@ -761,6 +926,7 @@ const AI_CHIPS = [
   "Caption kuning huruf besar di tengah layar",
   "Kecilkan musik saat ada suara, keraskan di akhir",
   "Tambah caption ajakan 'cek keranjang kuning' di 2 detik terakhir",
+  "Animasi pop, caption agak ke atas di tengah",
 ];
 
 function AiPanel({ busy, hasBgm, onRun }: { busy: boolean; hasBgm: boolean; onRun: (s: string) => void }) {

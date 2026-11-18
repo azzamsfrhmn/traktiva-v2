@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import ffmpegPath from "ffmpeg-static";
 import type { VideoProject } from "@/lib/db/schema";
-import { autoCaptions, clamp, DEFAULT_CAPTION_STYLE, round2, uid, type EditVoice, type ProjectEdit } from "@/lib/edit";
+import { ANIM_DUR, autoCaptions, CAPTION_ANIMS, clamp, DEFAULT_CAPTION_STYLE, DEFAULT_SAFE, normalizeEdit, round2, uid, type EditVoice, type ProjectEdit } from "@/lib/edit";
 import { probeMedia, resolveMedia, writeMedia } from "@/lib/media";
 import { concat } from "@/lib/projects";
 import { isSilent } from "@/lib/presets";
@@ -32,7 +32,7 @@ export async function prepareEdit(p: VideoProject): Promise<ProjectEdit> {
   );
   const baseKey = parts.map((x) => x.src).join("|");
   const old = p.edit;
-  if (old && old.baseKey === baseKey && (await exists(old.base))) return old;
+  if (old && old.baseKey === baseKey && (await exists(old.base))) return old.safe && old.captionStyle.anim ? old : normalizeEdit(old);
 
   const probes = await Promise.all(parts.map((x) => probeMedia(x.src)));
   const base = `${p.folder}/edit/base.mp4`;
@@ -69,14 +69,15 @@ export async function prepareEdit(p: VideoProject): Promise<ProjectEdit> {
     clips,
     clipVolume: old?.clipVolume ?? (voices.length ? 0.25 : 1),
     captions: old?.captions?.length ? old.captions : autoCaptions(segments),
-    captionStyle: old?.captionStyle ?? DEFAULT_CAPTION_STYLE,
+    captionStyle: { ...DEFAULT_CAPTION_STYLE, ...old?.captionStyle },
+    safe: old?.safe ?? DEFAULT_SAFE,
     voices,
     voiceVolume: old?.voiceVolume ?? 1,
     bgm: old?.bgm ?? null,
   };
 }
 
-export type CaptionOverlay = { start: number; end: number; x: number; y: number; png: string };
+export type CaptionOverlay = { start: number; end: number; x: number; y: number; w: number; h: number; png: string };
 
 /** Burn captions (PNG overlays drawn by the editor) + mix clip sound, voice-over and music → final.mp4. */
 export async function exportEdit(p: VideoProject, e: ProjectEdit, overlays: CaptionOverlay[]) {
@@ -87,9 +88,12 @@ export async function exportEdit(p: VideoProject, e: ProjectEdit, overlays: Capt
   const voiceIn = e.voices.map((v) => (args.push("-i", resolveMedia(v.src)), n++));
   const bgmIn = e.bgm ? (args.push("-stream_loop", "-1", "-ss", String(e.bgm.offset), "-i", resolveMedia(e.bgm.src)), n++) : -1;
   const dir = `${p.folder}/edit`;
+  const anim = e.captionStyle.anim ?? "none";
   const pngIn: number[] = [];
   for (const [i, o] of overlays.entries()) {
     const rel = await writeMedia(`${dir}/caption-${i + 1}.png`, Buffer.from(o.png.replace(/^data:image\/png;base64,/, ""), "base64"));
+    // animated: a looped still that only exists during the caption (itsoffset = its start on the timeline)
+    if (anim !== "none") args.push("-loop", "1", "-framerate", "30", "-t", (o.end - o.start).toFixed(2), "-itsoffset", o.start.toFixed(2));
     args.push("-i", resolveMedia(rel));
     pngIn.push(n++);
   }
@@ -97,7 +101,26 @@ export async function exportEdit(p: VideoProject, e: ProjectEdit, overlays: Capt
   const f: string[] = [];
   let v = "0:v";
   overlays.forEach((o, i) => {
-    f.push(`[${v}][${pngIn[i]}:v]overlay=${Math.round(o.x)}:${Math.round(o.y)}:enable='between(t,${o.start.toFixed(2)},${o.end.toFixed(2)})'[v${i}]`);
+    const x = Math.round(o.x), y = Math.round(o.y);
+    if (anim === "none") {
+      f.push(`[${v}][${pngIn[i]}:v]overlay=${x}:${y}:enable='between(t,${o.start.toFixed(2)},${o.end.toFixed(2)})'[v${i}]`);
+    } else {
+      // same curves as animState() in lib/edit.ts
+      const d = ANIM_DUR[anim], a = o.start.toFixed(2);
+      const P = (tv: string) => `clip((${tv}-${a})/${d},0,1)`;
+      let chain = "format=rgba";
+      let ox = String(x), oy = String(y);
+      if (anim === "fade" || anim === "naik") chain += `,fade=t=in:st=${a}:d=${d}:alpha=1`;
+      if (anim === "naik") oy = `'${y}+pow(1-${P("t")},3)*${round2(0.05 * e.height)}'`;
+      if (anim === "pop") {
+        const sc = `(0.6+0.4*(1+2.70158*pow(${P("t")}-1,3)+1.70158*pow(${P("t")}-1,2)))`;
+        chain += `,scale=w='max(2,trunc(iw*${sc}/2)*2)':h=-2:eval=frame,fade=t=in:st=${a}:d=${round2(d / 4)}:alpha=1`;
+        ox = `'${x}+(${Math.round(o.w)}-overlay_w)/2'`;
+        oy = `'${y}+(${Math.round(o.h)}-overlay_h)/2'`;
+      }
+      if (anim === "sapu") chain += `,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lt(X,W*${P("T")}),alpha(X,Y),0)'`;
+      f.push(`[${pngIn[i]}:v]${chain}[c${i}]`, `[${v}][c${i}]overlay=x=${ox}:y=${oy}:eof_action=pass[v${i}]`);
+    }
     v = `v${i}`;
   });
   const mix: string[] = ["[a0]"];
@@ -144,6 +167,7 @@ export async function aiAdjustEdit(p: VideoProject, e: ProjectEdit, instruction:
     clips: e.clips.map((c) => ({ label: c.label, start: c.start, dur: c.dur })),
     captions: e.captions.map(({ start, end, text }) => ({ start, end, text })),
     captionStyle: e.captionStyle,
+    safe: e.safe,
     voices: e.voices.map((v) => ({ id: v.id, start: v.start, durSec: round2(v.dur / v.speed), speed: v.speed, volume: v.volume, text: v.text })),
     clipVolume: e.clipVolume,
     voiceVolume: e.voiceVolume,
@@ -157,7 +181,7 @@ Instruction from the user (Indonesian): "${instruction.replace(/"/g, "'").slice(
 
 Rules:
 - Captions are on-screen text in casual Indonesian, max ~5 words each, must not overlap, must stay inside 0..durationSec, and should match when the voice speaks.
-- captionStyle.preset is one of tiktok|kotak|kuning|bersih; captionStyle.y is the vertical center (0 top, 1 bottom, keep 0.15-0.85, avoid the bottom 15% where TikTok UI sits); captionStyle.size is font size / video width (0.04-0.09); captionStyle.upper true = UPPERCASE.
+- captionStyle.preset is one of tiktok|kotak|kuning|bersih; captionStyle.anim is the entrance animation, one of none|pop|fade|naik|sapu; captionStyle.x / captionStyle.y are the horizontal / vertical center (0-1; text is kept inside the safe area "safe" automatically, so avoid its margins); captionStyle.size is font size / video width (0.04-0.09); captionStyle.upper true = UPPERCASE.
 - You may move voices (start), change their volume (0-2) or speed (0.8-1.4). Keep voices from overlapping each other.
 - Background music (bgm) usually sits at 0.1-0.25 under a voice-over. clipVolume is the original clip sound.
 - Only change what the instruction asks for (plus fixes needed to keep things valid). Keep everything else identical.
@@ -189,7 +213,9 @@ Output ONLY JSON with the same shape: {"captions":[...],"captionStyle":{...},"vo
     const s = ans.captionStyle;
     next.captionStyle = {
       preset: ["tiktok", "kotak", "kuning", "bersih"].includes(String(s.preset)) ? (s.preset as ProjectEdit["captionStyle"]["preset"]) : e.captionStyle.preset,
+      x: s.x != null ? round2(clamp(Number(s.x), 0.1, 0.9)) : e.captionStyle.x,
       y: s.y != null ? round2(clamp(Number(s.y), 0.1, 0.9)) : e.captionStyle.y,
+      anim: CAPTION_ANIMS.some((a) => a.id === s.anim) ? (s.anim as ProjectEdit["captionStyle"]["anim"]) : e.captionStyle.anim,
       size: s.size != null ? clamp(Number(s.size), 0.035, 0.1) : e.captionStyle.size,
       upper: s.upper != null ? !!s.upper : e.captionStyle.upper,
     };

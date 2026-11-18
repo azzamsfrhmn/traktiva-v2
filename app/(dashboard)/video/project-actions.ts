@@ -10,7 +10,7 @@ import { googleAccounts, videoProjects, type ProjectScene } from "@/lib/db/schem
 import fs from "node:fs/promises";
 import { createProjectFolder, probeMedia, removeMedia, resolveMedia, writeMedia } from "@/lib/media";
 import { aiAdjustEdit, exportEdit, prepareEdit } from "@/lib/editor";
-import { clamp, round2, type ProjectEdit } from "@/lib/edit";
+import { clamp, DEFAULT_SAFE, round2, type ProjectEdit } from "@/lib/edit";
 import { defaultOptions, draftCaption, presetById, projectName } from "@/lib/presets";
 import { addToLibrary, copyIntoProject, listGenerated, listUploads } from "@/lib/library";
 import { queueImages, queueRender } from "@/lib/projects";
@@ -338,8 +338,9 @@ const Num = z.number().finite();
 const EditInput = z.object({
   clipVolume: Num,
   voiceVolume: Num,
-  captions: z.array(z.object({ id: z.string().max(20), start: Num, end: Num, text: z.string().max(200) })).max(200),
-  captionStyle: z.object({ preset: z.enum(["tiktok", "kotak", "kuning", "bersih"]), y: Num, size: Num, upper: z.boolean() }),
+  captions: z.array(z.object({ id: z.string().max(20), start: Num, end: Num, text: z.string().max(200), pos: z.object({ x: Num, y: Num, size: Num }).nullish() })).max(200),
+  captionStyle: z.object({ preset: z.enum(["tiktok", "kotak", "kuning", "bersih"]), x: Num.default(0.5), y: Num, size: Num, upper: z.boolean(), anim: z.enum(["none", "fade", "pop", "naik", "sapu"]).default("pop") }),
+  safe: z.object({ top: Num, bottom: Num, left: Num, right: Num }).optional(),
   voices: z.array(z.object({ id: z.string(), start: Num, speed: Num, volume: Num })).max(50),
   bgm: z.object({ src: z.string(), name: z.string().max(120), dur: Num, volume: Num, offset: Num, fade: z.boolean() }).nullable(),
 });
@@ -358,9 +359,18 @@ function mergeEdit(p: Awaited<ReturnType<typeof get>>, patch: EditPatch): Projec
     voiceVolume: round2(clamp(d.voiceVolume, 0, 2)),
     captions: d.captions.map((c) => {
       const start = round2(clamp(c.start, 0, D - 0.1));
-      return { id: c.id, start, end: round2(clamp(c.end, start + 0.1, D)), text: c.text };
+      const pos = c.pos && { x: round2(clamp(c.pos.x, 0.02, 0.98)), y: round2(clamp(c.pos.y, 0.02, 0.98)), size: clamp(c.pos.size, 0.03, 0.12) };
+      return { id: c.id, start, end: round2(clamp(c.end, start + 0.1, D)), text: c.text, ...(pos ? { pos } : {}) };
     }),
-    captionStyle: { preset: d.captionStyle.preset, y: clamp(d.captionStyle.y, 0.05, 0.95), size: clamp(d.captionStyle.size, 0.03, 0.12), upper: d.captionStyle.upper },
+    captionStyle: {
+      preset: d.captionStyle.preset,
+      x: round2(clamp(d.captionStyle.x, 0.02, 0.98)),
+      y: clamp(d.captionStyle.y, 0.02, 0.98),
+      size: clamp(d.captionStyle.size, 0.03, 0.12),
+      upper: d.captionStyle.upper,
+      anim: d.captionStyle.anim,
+    },
+    safe: d.safe ? { top: clamp(d.safe.top, 0, 0.4), bottom: clamp(d.safe.bottom, 0, 0.4), left: clamp(d.safe.left, 0, 0.4), right: clamp(d.safe.right, 0, 0.4) } : (e.safe ?? DEFAULT_SAFE),
     voices: e.voices.map((v) => {
       const x = d.voices.find((y) => y.id === v.id);
       return x ? { ...v, start: round2(clamp(x.start, 0, D - 0.1)), speed: round2(clamp(x.speed, 0.5, 2)), volume: round2(clamp(x.volume, 0, 2)) } : v;
@@ -407,7 +417,7 @@ export async function aiEditTimeline(id: number, patch: EditPatch, instruction: 
   return { edit, note };
 }
 
-const Overlay = z.array(z.object({ start: Num, end: Num, x: Num, y: Num, png: z.string().startsWith("data:image/png;base64,").max(3_000_000) })).max(200);
+const Overlay = z.array(z.object({ start: Num, end: Num, x: Num, y: Num, w: Num.default(0), h: Num.default(0), png: z.string().startsWith("data:image/png;base64,").max(3_000_000) })).max(200);
 
 export async function exportTimeline(id: number, patch: EditPatch, overlays: z.input<typeof Overlay>) {
   const p = await get(id);
